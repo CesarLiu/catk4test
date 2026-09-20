@@ -8,6 +8,7 @@ scikit-learn==1.5.1 # BSD 3-Clause License: https://github.com/scikit-learn/scik
 
 # visualization
 opencv-python-headless==4.10.0.84 # MIT License: https://github.com/opencv/opencv-python/blob/master/LICENSE.txt
+matplotlib==3.9.2 # PSF-based License: https://matplotlib.org/stable/users/project/license.html # used by src/utils/vis_waymo.py and scripts/responsibility/ex_post_analysis.py
 
 # for waymo dataset
 tensorboard==2.12.3 # Apache License 2.0: https://github.com/tensorflow/tensorboard/blob/master/LICENSE

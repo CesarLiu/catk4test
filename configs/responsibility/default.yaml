@@ -1,0 +1,46 @@
+# Reference hyperparameters for the counterfactual-responsibility pipeline
+# (src/responsibility/*). The CLI scripts in scripts/responsibility/ expose
+# these as --flags with the same defaults; this file documents them and can
+# be hand-edited as a record of a particular run's settings.
+
+# --- Sec. III: responsibility metrics ---
+n_safety_samples: 40 # size of Xi^(a)_k, the counterfactual motion set (paper: 40)
+cvar_alpha: 0.1 # CVaR confidence level for safety responsibility (paper: 0.1)
+n_courtesy_samples: 20 # samples per with/without-agent condition (paper: 20 each)
+neighbor_radius: 30.0 # meters; the paper does not state one. Deliberately tighter than
+# SMART's own 60 m a2a_radius: past ~30 m an "alternative" gains
+# distance against a neighbour trivially and swamps the metric.
+d_sat: 10.0 # meters at which D_g saturates; null reproduces the paper's
+# literal unsaturated definition (see geometry.py::saturate)
+metric_horizon: 20 # future steps @10Hz over which beta is measured (2 s, as in the
+# paper). Fixed so beta stays comparable across context times k.
+num_historical_steps: 11 # must match the checkpoint's decoder.num_historical_steps
+n_collision_circles: 3 # circles per vehicle footprint; 1 would make adjacent lanes collide
+collision_margin: 0.0 # extra meters added to the combined-radius collision threshold
+collision_weight: 10.0 # weight on collision cost in R = -10*c_coll - c_dev (Sec. V-B)
+drivable_half_width: 3.0 # meters; road-deviation cost threshold (approximation, see
+# src/responsibility/geometry.py::road_deviation_cost and
+# scripts/responsibility/inspect_map_types.py)
+courtesy_skip_distance: 20.0 # skip the courtesy rollouts for pairs this far apart, where
+# the Boltzmann KL is provably 0; null disables the shortcut
+
+# --- Sec. IV-A: HMM responsibility-level abstraction ---
+hmm_n_states_grid: [3, 5, 7, 9, 11] # paper sweeps these and picks lowest BIC
+hmm_n_iter: 100
+
+# --- Sec. IV-B / V-C: reward networks + auxiliary trajectories ---
+n_aux: 24 # auxiliary (fake) trajectories per real data point (paper: 24)
+reward_hidden_dim: 32 # two hidden layers of this width (paper: 32)
+reward_n_epochs: 300
+reward_lr: 0.001
+
+# --- motion-set sampling scheme (src/smart/utils/rollout.py) ---
+motion_set_num_k: 2048 # ~= full agent-token vocabulary size -> approximates
+# genuine sampling from pi_theta rather than a narrow top-k
+motion_set_temp: 1.0
+
+# --- scope ---
+num_historical_steps: 11 # must match configs/model/*.yaml decoder.num_historical_steps
+agent_type_filter: 0 # 0=vehicle, 1=pedestrian, 2=cyclist, null=all (paper: vehicle-vehicle only)
+max_agents_per_scenario: null
+max_scenarios: null

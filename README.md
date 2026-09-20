@@ -93,6 +93,14 @@ The submission of our reproduced SMART to the test split is found [here](https:/
 Please refer to [docs/ablation_models.md](docs/ablation_models.md) for the configurations of ablation models.
 Specifically you will find the data augmentation methods used by [SMART](https://arxiv.org/abs/2207.05844) and [Trajeglish](https://arxiv.org/abs/2312.04535).
 
+## Counterfactual-responsibility interpretability framework
+
+`src/responsibility/` ports Hsu et al., ["Interpretable Trajectory Prediction for
+Autonomous Vehicles via Counterfactual Responsibility"](https://saferobotics.princeton.edu/research/responsibility)
+(IROS 2023) onto SMART/WOMD: counterfactual safety/courtesy responsibility metrics,
+an HMM-based responsibility-level abstraction, and per-level reward networks for
+fine-tuning or re-ranking predictions. See [docs/responsibility.md](docs/responsibility.md).
+
 ## Acknowledgement
 
 Our code is based on [SMART](https://github.com/rainmaker22/SMART). We appreciate them for the valuable open-source code! Please don't forget to cite their amazing work as well!

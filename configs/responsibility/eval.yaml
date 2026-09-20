@@ -1,0 +1,18 @@
+# @package _global_
+# Minimal Hydra config tree for loading a SMART checkpoint outside of the
+# full src/run.py training entry point (no callbacks/logger/experiment
+# groups, which src/responsibility scripts don't need). Composed via
+# src.responsibility.pipeline.compose_responsibility_config().
+defaults:
+  - _self_
+  # leading "/" is required: this config lives in the "responsibility" group
+  # (configs/responsibility/), so unqualified group refs would otherwise
+  # resolve relative to configs/responsibility/ instead of the configs/ root.
+  - /data: waymo
+  - /model: smart
+  - /paths: default
+  - /trainer: default
+  - /hydra: default
+
+seed: 817
+task_name: "responsibility"
