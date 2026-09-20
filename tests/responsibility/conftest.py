@@ -194,7 +194,12 @@ class FakeTokenProcessor:
         self.n_token_agent = N_TOKEN
 
     def __call__(self, data):
-        return make_tokenized_map(), make_tokenized_agent(self.n_agent)
+        n_agent = self.n_agent
+        try:  # follow the scenario when handed real-shaped data
+            n_agent = data["agent"]["position"].shape[0]
+        except (KeyError, TypeError, AttributeError):
+            pass
+        return make_tokenized_map(), make_tokenized_agent(n_agent)
 
 
 class FakeSMART:

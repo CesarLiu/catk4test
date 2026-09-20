@@ -173,17 +173,23 @@ than the full `src/run.py` training entry point.
 
 ## Testing
 
-`tests/responsibility/` covers the model-independent math (geometry costs,
-CVaR, the Gaussian HMM, and reward-network training) with synthetic data
-and runs without a checkpoint or `torch_geometric`/`torch_scatter`/
-`torch_cluster`:
+`tests/responsibility/` runs without a checkpoint, `torch_geometric`,
+`torch_scatter` or `torch_cluster`. A stubbed agent decoder
+(`conftest.py`) stands in for SMART's sampler, which lets the tests cover
+not just the model-independent math (geometry costs, CVaR, the Gaussian
+HMM, reward-network training) but also the counterfactual machinery
+itself: ground-truth token forcing and its per-step bookkeeping, agent
+removal, rollout batching and truncation, context shifting, causal window
+selection, and an end-to-end pass through both responsibility metrics,
+level assignment, reward features and online selection:
 
 ```bash
 python -m pytest tests/responsibility -q
 ```
 
-The SMART-dependent modules (`motion_set.py`, and everything built on it)
-require this repo's full environment (a loaded checkpoint and cached WOMD
-data) to exercise end-to-end; they were verified by careful code review and
-by unit-testing every piece of math they call, but not run against a real
-model in this change.
+What the stub cannot check is whether the *model* behaves as assumed:
+that forcing a neighbour onto its logged tokens really reproduces its
+logged trajectory, that zeroing a validity mask really removes an agent
+from every attention edge, and that replicated scene copies really stay
+independent. Those hold by construction from reading SMART's decoder, but
+confirming them needs a real checkpoint and cached WOMD data.
