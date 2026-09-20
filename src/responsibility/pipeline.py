@@ -19,6 +19,7 @@ from src.responsibility.dataset_builder import (
     compute_scenario_responsibility,
     group_sequences,
     sequences_as_arrays,
+    window_steps,
 )
 from src.responsibility.hmm import GaussianHMM, ModelSelectionResult, fit_hmm_with_model_selection
 from src.responsibility.metrics import ResponsibilityConfig
@@ -101,11 +102,17 @@ def compute_dataset_responsibility(
     max_scenarios: Optional[int] = None,
     keep_data: bool = True,
     rollout_batch_size: int = 8,
+    sweep_windows: bool = True,
 ) -> Tuple[List[ResponsibilityObservation], Dict[str, object]]:
     """Runs Sec. III's counterfactual responsibility pipeline over every
     scenario in ``dataloader``. Returns the flat observation list and (if
     ``keep_data``) a ``scenario_id -> data`` dict for reuse when building
-    the reward-network training features later."""
+    the reward-network training features later.
+
+    With ``sweep_windows`` (the default) each clip is evaluated at several
+    current steps spaced ``cfg.window_stride`` apart, so every agent yields
+    a beta *sequence* and the HMM can learn transitions; otherwise only the
+    clip's native current step is used."""
     synthesizer = MotionSetSynthesizer(
         model, sampling_scheme or default_sampling_scheme(), rollout_batch_size=rollout_batch_size
     )
@@ -116,12 +123,18 @@ def compute_dataset_responsibility(
         if max_scenarios is not None and i >= max_scenarios:
             break
         scenario_id = str(data["scenario_id"][0]) if "scenario_id" in data else str(i)
+        steps = (
+            window_steps(data, cfg, synthesizer, cfg.window_stride)
+            if sweep_windows
+            else None
+        )
         obs = compute_scenario_responsibility(
             synthesizer,
             data,
             cfg,
             agent_type_filter=agent_type_filter,
             max_agents=max_agents_per_scenario,
+            steps=steps,
         )
         for o in obs:
             o.scenario_id = scenario_id

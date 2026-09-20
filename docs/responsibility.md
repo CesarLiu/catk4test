@@ -44,16 +44,17 @@ used by this repo's `WOSACMetrics`.
 
 ## Scoping decisions and approximations (read before trusting numbers)
 
-- **One responsibility observation per (scenario, agent) by default.**
-  The paper computes a dense responsibility *sequence* per agent from
-  nuScenes' 20s scenes at 0.1s intervals. This repo's cached WOMD scenarios
-  are short (~9.1s), non-overlapping clips, so by default we compute one
-  observation per queried agent at the clip's native current step. Fed to
-  the HMM, this still gives a valid level abstraction (the emission model),
-  just without a learned transition matrix beyond the uniform prior. See
-  `dataset_builder.sliding_window_contexts` for an experimental way to get
-  genuine within-clip sequences by re-slicing one cached scenario at
-  several shifted "current steps."
+- **Sequences come from sweeping the current step within a clip.** The
+  paper evaluates responsibility every 0.1 s across nuScenes' 20 s scenes;
+  this repo's cached WOMD scenarios are short (~9.1 s), non-overlapping
+  clips. We therefore sweep the *current step* inside each clip
+  (`window_stride`, default 5 steps = 0.5 s), re-anchoring it with
+  `motion_set.shifted_context`, so each agent still yields a genuine beta
+  sequence and the HMM's transition matrix is fitted on real transitions
+  rather than staying at its uniform prior. `--no-sweep-windows` falls
+  back to one observation per clip. Windows are capped so that a shifted
+  clip still has enough tokenized future for the decoder to roll out
+  (`last_usable_window_step`).
 - **CVaR convention.** We use the confidence-level convention where
   `alpha -> 1` means "average over the single worst sample" (an upper-tail
   average), because that is the limit the paper's own text states. The
@@ -88,6 +89,16 @@ used by this repo's `WOSACMetrics`.
   zero (the two rewards differ only in the collision term against the
   queried agent). This is a compute shortcut with no effect on the
   non-zero values; set it to `0` to disable.
+- **Levels used online are causal.** beta at context step k is computed
+  from the logged future over [k+1, k+metric_horizon], so it is only known
+  at k+metric_horizon. The online selection path therefore takes its
+  responsibility history from `causal_window_steps`, which keeps only
+  windows that have closed by the prediction step. Scoring a prediction
+  with a level derived from the future it is being compared against would
+  leak the answer; this is the paper's `z_{k-T_f}` indexing made explicit.
+  The practical consequence is that the demo predicts from a later step
+  (default 50) rather than the clip's native current step, which is too
+  early for any window to have closed.
 - **Vehicle-vehicle only by default** (`agent_type_filter=0`), matching the
   paper's stated scope; pass `--agent-type -1` to include all types (the
   underlying dynamics/geometry code is not vehicle-specific).

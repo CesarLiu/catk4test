@@ -14,6 +14,9 @@ d_sat: 10.0 # meters at which D_g saturates; null reproduces the paper's
 # literal unsaturated definition (see geometry.py::saturate)
 metric_horizon: 20 # future steps @10Hz over which beta is measured (2 s, as in the
 # paper). Fixed so beta stays comparable across context times k.
+window_stride: 5 # spacing (10Hz steps) between the context steps swept within one
+# clip; each step yields one beta, so a clip gives a sequence the HMM's
+# transition matrix can actually be fitted on
 num_historical_steps: 11 # must match the checkpoint's decoder.num_historical_steps
 n_collision_circles: 3 # circles per vehicle footprint; 1 would make adjacent lanes collide
 collision_margin: 0.0 # extra meters added to the combined-radius collision threshold

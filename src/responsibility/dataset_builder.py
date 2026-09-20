@@ -3,23 +3,25 @@ WOMD scenarios: per-agent responsibility observations, HMM-based level
 labels, and per-level (real vs. auxiliary) trajectory feature sets used to
 train the reward networks in :mod:`src.responsibility.reward_model`.
 
-Scoping note on "sequences". The paper computes a dense responsibility
-*sequence* per agent by re-evaluating Eq. (3)/(4) at every 0.1s timestep
-across nuScenes' 20s scenes, then fits the HMM on those long sequences.
-This repo's cached WOMD scenarios are instead short, non-overlapping
-~9.1s clips (one context per file), so by default we compute a single
-responsibility observation per (scenario, queried agent) at the clip's
-native current step (``num_historical_steps - 1``). Fed to
-:class:`~src.responsibility.hmm.GaussianHMM`, length-1 sequences still
-give a valid level *abstraction* (Sec. IV-A's emission model B), just
-without a learned transition matrix A beyond the uniform prior. For
-users who want genuine within-clip temporal sequences,
-:func:`sliding_window_contexts` re-slices one cached scenario at several
-shifted "current steps" k so the same agent yields a multi-step sequence;
-this is an optional, less battle-tested extension (see its docstring).
+Responsibility *sequences*. The paper re-evaluates Eq. (3)/(4) at every
+0.1s step of nuScenes' 20s scenes, and the HMM's transition matrix (Sec.
+IV-A) only means anything if it is fitted on such sequences. This repo's
+cached WOMD scenarios are short (~9.1s), non-overlapping clips, so we
+instead sweep the *current step* within a clip: :func:`window_steps`
+picks k = k0, k0+stride, ..., and each one is evaluated under
+:func:`~src.responsibility.motion_set.shifted_context`, which re-anchors
+the clip so that k is the present. One clip therefore yields a genuine
+multi-step beta sequence per agent.
+
+Each beta at k needs ``metric_horizon`` steps of *logged future* to be
+computable, so it is only known at k + metric_horizon. Anything that
+consumes a level to make a prediction at time k_predict must therefore
+use windows ending at or before k_predict -- see
+:func:`causal_window_steps`, which enforces exactly that and is what the
+online selection path uses to avoid conditioning on the future it is
+being scored against.
 """
 
-import copy
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -35,7 +37,11 @@ from src.responsibility.metrics import (
     ground_truth_boxes,
     rollout_boxes,
 )
-from src.responsibility.motion_set import MotionSetSynthesizer, find_neighbors
+from src.responsibility.motion_set import (
+    MotionSetSynthesizer,
+    find_neighbors,
+    shifted_context,
+)
 from src.responsibility.reward_model import extract_trajectory_features, trajectory_log_prob
 
 
@@ -56,20 +62,79 @@ def get_map_points(data) -> Optional[Tensor]:
         return None
 
 
+def last_usable_window_step(
+    n_step_total: int, cfg: ResponsibilityConfig, token_shift: int, rollout_horizon: int
+) -> int:
+    """Largest current step k for which a shifted clip still has enough
+    tokenized future for the model to roll out ``rollout_horizon`` steps.
+
+    The tokenizer lays tokens on a ``token_shift`` grid and the rollout
+    consumes ``step_current + rollout_horizon/token_shift`` of them, so a
+    window too close to the end of the clip would index past the token
+    arrays inside the decoder.
+    """
+    step_current_2hz = (cfg.num_historical_steps - 1) // token_shift
+    needed = token_shift * (step_current_2hz + rollout_horizon // token_shift) + 1
+    return n_step_total + cfg.num_historical_steps - 1 - needed
+
+
+def window_steps(
+    data,
+    cfg: ResponsibilityConfig,
+    synthesizer: MotionSetSynthesizer,
+    stride: int,
+    first_step: Optional[int] = None,
+    last_step: Optional[int] = None,
+) -> List[int]:
+    """Current steps at which responsibility is evaluated within one clip."""
+    n_step_total = data["agent"]["position"].shape[1]
+    rollout_horizon = synthesizer.round_horizon(cfg.metric_horizon)
+    k0 = cfg.num_historical_steps - 1 if first_step is None else first_step
+    k_last = last_usable_window_step(n_step_total, cfg, synthesizer.token_shift, rollout_horizon)
+    if last_step is not None:
+        k_last = min(k_last, last_step)
+    return list(range(k0, k_last + 1, max(1, stride)))
+
+
+def causal_window_steps(
+    data,
+    cfg: ResponsibilityConfig,
+    synthesizer: MotionSetSynthesizer,
+    predict_step: int,
+    stride: int,
+) -> List[int]:
+    """Window steps whose responsibility is already *known* at ``predict_step``.
+
+    beta at k is computed from the logged future over [k+1, k+metric_horizon],
+    so it is only observable from k + metric_horizon onwards. Using a level
+    derived from a later window to make a prediction at ``predict_step``
+    would condition the prediction on the ground truth it is scored
+    against; this is the guard against that.
+    """
+    return window_steps(
+        data,
+        cfg,
+        synthesizer,
+        stride,
+        last_step=predict_step - cfg.metric_horizon,
+    )
+
+
 def compute_scenario_responsibility(
     synthesizer: MotionSetSynthesizer,
     data,
     cfg: ResponsibilityConfig,
     agent_type_filter: Optional[int] = 0,
     max_agents: Optional[int] = None,
+    steps: Optional[Sequence[int]] = None,
 ) -> List[ResponsibilityObservation]:
-    """One responsibility observation per queried agent at the scenario's
-    native current step (Eq. 3/4/5), for every agent whose type matches
-    ``agent_type_filter`` (default 0 = vehicle, matching the paper's
-    vehicle-vehicle scope; pass ``None`` for all types)."""
-    tokenized_map, tokenized_agent = synthesizer.tokenize(data)
-    n_agent = data["agent"]["position"].shape[0]
-    at_step = cfg.num_historical_steps - 1
+    """Responsibility observations (Eq. 3/4/5) for every agent matching
+    ``agent_type_filter`` (default 0 = vehicle, the paper's vehicle-vehicle
+    scope; ``None`` for all types), at each requested current step.
+
+    ``steps`` defaults to the clip's native current step; pass the output
+    of :func:`window_steps` to get a per-agent sequence instead.
+    """
     # data comes from a batch_size=1 DataLoader, so PyG collates
     # "scenario_id" (a per-graph, non-tensor attribute) into a length-1 list.
     # Callers that already know the scenario_id (e.g. compute_dataset_responsibility)
@@ -79,6 +144,36 @@ def compute_scenario_responsibility(
         scenario_id = str(raw_scenario_id[0]) if isinstance(raw_scenario_id, (list, tuple)) else str(raw_scenario_id)
     else:
         scenario_id = "unknown"
+
+    if steps is None:
+        steps = [cfg.num_historical_steps - 1]
+
+    observations: List[ResponsibilityObservation] = []
+    for k in steps:
+        with shifted_context(data, k, cfg.num_historical_steps):
+            observations.extend(
+                _responsibility_at_current_step(
+                    synthesizer, data, cfg, scenario_id, k, agent_type_filter, max_agents
+                )
+            )
+    return observations
+
+
+def _responsibility_at_current_step(
+    synthesizer: MotionSetSynthesizer,
+    data,
+    cfg: ResponsibilityConfig,
+    scenario_id: str,
+    k: int,
+    agent_type_filter: Optional[int],
+    max_agents: Optional[int],
+) -> List[ResponsibilityObservation]:
+    """``data`` must already be anchored so that ``cfg.num_historical_steps - 1``
+    is the current step (see ``shifted_context``); ``k`` is only carried
+    through to the observation for bookkeeping."""
+    tokenized_map, tokenized_agent = synthesizer.tokenize(data)
+    n_agent = data["agent"]["position"].shape[0]
+    at_step = cfg.num_historical_steps - 1
     map_points = get_map_points(data)
 
     candidates = [
@@ -117,36 +212,11 @@ def compute_scenario_responsibility(
                 scenario_id=str(scenario_id),
                 agent_id=int(data["agent"]["id"][a]),
                 agent_idx=a,
-                k=at_step,
+                k=k,
                 beta=result["beta"].detach().cpu(),
             )
         )
     return observations
-
-
-def sliding_window_contexts(
-    data, k_values: Sequence[int], num_historical_steps: int = 11
-):
-    """Experimental: re-slices one cached scenario so index ``k`` becomes the
-    new "current step" boundary, by shifting the agent time-series tensors.
-    Returns a list of ``(k, shifted_data)``; only ``k >= num_historical_steps - 1``
-    with enough trailing steps in the original clip are returned. Map/static
-    fields are shared (not copied) with the original ``data``.
-    """
-    n_step = data["agent"]["position"].shape[1]
-    time_fields = ["position", "heading", "velocity", "valid_mask"]
-    results = []
-    for k in k_values:
-        start = k - (num_historical_steps - 1)
-        if start < 0 or start >= n_step:
-            continue
-        shifted = copy.copy(data)
-        shifted["agent"] = copy.copy(data["agent"])
-        for f in time_fields:
-            if f in data["agent"]:
-                shifted["agent"][f] = data["agent"][f][:, start:]
-        results.append((k, shifted))
-    return results
 
 
 def group_sequences(
@@ -201,66 +271,12 @@ def build_reward_training_features(
     for obs in observations:
         if obs.level is None:
             continue
-        data = data_by_scenario[obs.scenario_id]
-        tokenized_map, tokenized_agent = synthesizer.tokenize(data)
-        n_agent = data["agent"]["position"].shape[0]
-        all_idx = [i for i in range(n_agent) if i != obs.agent_idx]
-        map_points = get_map_points(data)
-
-        rollouts = synthesizer.sample_rollouts(
-            tokenized_map,
-            tokenized_agent,
-            free_agent_indices=[obs.agent_idx],
-            n_samples=n_aux,
-            sampling_scheme=sampling_scheme,
-            rollout_horizon=synthesizer.round_horizon(cfg.metric_horizon),
-        )
-        aux_log_prob = trajectory_log_prob(
-            rollouts["next_token_logits"][:, 0],
-            rollouts["next_token_idx"][:, 0],
-            rollouts["next_token_valid"][:, 0],
-        )  # [n_aux]
-        # The logged trajectory's own model log-probability, from a pass in
-        # which *every* agent replays ground truth (i.e. teacher forcing).
-        # Leaving this at 0 for real trajectories and negative for sampled
-        # ones would hand the discriminator a trivial shortcut feature.
-        gt_scored = synthesizer.sample_rollouts(
-            tokenized_map,
-            tokenized_agent,
-            free_agent_indices=[],
-            n_samples=1,
-            output_agent_indices=[obs.agent_idx],
-            sampling_scheme=sampling_scheme,
-            rollout_horizon=synthesizer.round_horizon(cfg.metric_horizon),
-        )
-        gt_log_prob = trajectory_log_prob(
-            gt_scored["next_token_logits"][:, 0],
-            gt_scored["next_token_idx"][:, 0],
-            gt_scored["next_token_valid"][:, 0],
-        )  # [1]
-
-        horizon = effective_horizon(data, cfg, rollouts["pred_traj_10hz"].shape[2])
-        gt_ego = ground_truth_boxes(data, [obs.agent_idx], cfg.num_historical_steps, horizon)
-        others = ground_truth_boxes(data, all_idx, cfg.num_historical_steps, horizon)
-        origin = data["agent"]["position"][obs.agent_idx, cfg.num_historical_steps - 1, :2]
-
-        aux_ego = rollout_boxes(rollouts, 0, data["agent"]["shape"][obs.agent_idx], horizon)
-        # score sampled and logged trajectories over the same valid steps
-        aux_ego.valid = gt_ego.valid.expand(len(aux_ego), -1)
-
-        feature_kwargs = dict(
-            map_points=map_points,
-            n_circles=cfg.n_collision_circles,
-            collision_margin=cfg.collision_margin,
-            drivable_half_width=cfg.drivable_half_width,
-        )
-        real_feat = extract_trajectory_features(
-            gt_ego, others, origin, log_prob=gt_log_prob, **feature_kwargs
-        ).squeeze(0)
-        fake_feat = extract_trajectory_features(
-            aux_ego, others, origin, log_prob=aux_log_prob, **feature_kwargs
-        )
-
+        with shifted_context(
+            data_by_scenario[obs.scenario_id], obs.k, cfg.num_historical_steps
+        ) as data:
+            real_feat, fake_feat = _features_for_observation(
+                synthesizer, data, obs, cfg, n_aux, sampling_scheme
+            )
         real_list, fake_list = buckets.setdefault(obs.level, ([], []))
         real_list.append(real_feat)
         fake_list.append(fake_feat)
@@ -270,3 +286,75 @@ def build_reward_training_features(
         for level, (real_list, fake_list) in buckets.items()
         if len(real_list) > 0
     }
+
+
+def _features_for_observation(
+    synthesizer: MotionSetSynthesizer,
+    data,
+    obs: ResponsibilityObservation,
+    cfg: ResponsibilityConfig,
+    n_aux: int,
+    sampling_scheme,
+) -> Tuple[Tensor, Tensor]:
+    """Feature vectors of one logged trajectory and of ``n_aux`` auxiliary
+    ones sampled from the model in the same context."""
+    tokenized_map, tokenized_agent = synthesizer.tokenize(data)
+    n_agent = data["agent"]["position"].shape[0]
+    all_idx = [i for i in range(n_agent) if i != obs.agent_idx]
+    map_points = get_map_points(data)
+    horizon_arg = synthesizer.round_horizon(cfg.metric_horizon)
+
+    rollouts = synthesizer.sample_rollouts(
+        tokenized_map,
+        tokenized_agent,
+        free_agent_indices=[obs.agent_idx],
+        n_samples=n_aux,
+        sampling_scheme=sampling_scheme,
+        rollout_horizon=horizon_arg,
+    )
+    aux_log_prob = trajectory_log_prob(
+        rollouts["next_token_logits"][:, 0],
+        rollouts["next_token_idx"][:, 0],
+        rollouts["next_token_valid"][:, 0],
+    )  # [n_aux]
+    # The logged trajectory's own model log-probability, from a pass in
+    # which *every* agent replays ground truth (i.e. teacher forcing).
+    # Leaving this at 0 for real trajectories and negative for sampled
+    # ones would hand the discriminator a trivial shortcut feature.
+    gt_scored = synthesizer.sample_rollouts(
+        tokenized_map,
+        tokenized_agent,
+        free_agent_indices=[],
+        n_samples=1,
+        output_agent_indices=[obs.agent_idx],
+        sampling_scheme=sampling_scheme,
+        rollout_horizon=horizon_arg,
+    )
+    gt_log_prob = trajectory_log_prob(
+        gt_scored["next_token_logits"][:, 0],
+        gt_scored["next_token_idx"][:, 0],
+        gt_scored["next_token_valid"][:, 0],
+    )  # [1]
+
+    horizon = effective_horizon(data, cfg, rollouts["pred_traj_10hz"].shape[2])
+    gt_ego = ground_truth_boxes(data, [obs.agent_idx], cfg.num_historical_steps, horizon)
+    others = ground_truth_boxes(data, all_idx, cfg.num_historical_steps, horizon)
+    origin = data["agent"]["position"][obs.agent_idx, cfg.num_historical_steps - 1, :2]
+
+    aux_ego = rollout_boxes(rollouts, 0, data["agent"]["shape"][obs.agent_idx], horizon)
+    # score sampled and logged trajectories over the same valid steps
+    aux_ego.valid = gt_ego.valid.expand(len(aux_ego), -1)
+
+    feature_kwargs = dict(
+        map_points=map_points,
+        n_circles=cfg.n_collision_circles,
+        collision_margin=cfg.collision_margin,
+        drivable_half_width=cfg.drivable_half_width,
+    )
+    real_feat = extract_trajectory_features(
+        gt_ego, others, origin, log_prob=gt_log_prob, **feature_kwargs
+    ).squeeze(0)
+    fake_feat = extract_trajectory_features(
+        aux_ego, others, origin, log_prob=aux_log_prob, **feature_kwargs
+    )
+    return real_feat, fake_feat

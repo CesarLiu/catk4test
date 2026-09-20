@@ -37,6 +37,10 @@ class ResponsibilityConfig:
     # sliding windows), where the amount of remaining logged future varies.
     # 20 steps @10Hz = 2 s, matching the paper's prediction horizon.
     metric_horizon: int = 20
+    # Spacing between the context steps at which responsibility is evaluated
+    # within one clip; 5 steps = 0.5 s. Smaller gives longer beta sequences
+    # for the HMM to learn transitions from, at proportional cost.
+    window_stride: int = 5
     # Must match the loaded checkpoint's decoder.num_historical_steps; it
     # defines where the logged future starts.
     num_historical_steps: int = 11

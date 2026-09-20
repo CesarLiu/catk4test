@@ -162,6 +162,64 @@ def replicate_scene(
     return map_out, agent_out
 
 
+AGENT_TIME_FIELDS = ("position", "heading", "velocity", "valid_mask")
+
+
+def _agent_time_tensors(data) -> Dict[str, Tensor]:
+    store = data["agent"]
+    found = {}
+    for field in AGENT_TIME_FIELDS:
+        try:
+            value = store[field]
+        except (KeyError, AttributeError):
+            continue
+        if torch.is_tensor(value):
+            found[field] = value
+    return found
+
+
+@contextlib.contextmanager
+def isolated_agent_time_fields(data):
+    """Swaps the agent time-series tensors for copies for the duration of
+    the block, so callees that mutate them in place cannot touch the
+    caller's data, then restores the originals."""
+    originals = _agent_time_tensors(data)
+    store = data["agent"]
+    try:
+        for field, value in originals.items():
+            store[field] = value.clone()
+        yield data
+    finally:
+        for field, value in originals.items():
+            store[field] = value
+
+
+@contextlib.contextmanager
+def shifted_context(data, k: int, num_historical_steps: int):
+    """Re-anchors a cached scenario so that step ``k`` is the current step.
+
+    The agent time series are sliced to start ``num_historical_steps - 1``
+    steps before k, so everything downstream (tokenization, the rollout's
+    own notion of "now", and the logged-future slicing in metrics) sees k
+    as the present without any of it needing to know about windowing. The
+    slices are views; restoration is exact.
+    """
+    start = k - (num_historical_steps - 1)
+    if start < 0:
+        raise ValueError(
+            f"context step {k} needs {num_historical_steps - 1} steps of history"
+        )
+    originals = _agent_time_tensors(data)
+    store = data["agent"]
+    try:
+        for field, value in originals.items():
+            store[field] = value[:, start:]
+        yield data
+    finally:
+        for field, value in originals.items():
+            store[field] = value
+
+
 def _horizon_owner(encoder):
     """SMARTDecoder delegates the rollout loop to its agent encoder; the
     test double implements it directly."""
@@ -227,7 +285,18 @@ class MotionSetSynthesizer:
 
     @torch.no_grad()
     def tokenize(self, data):
-        return self.model.token_processor(data)
+        # TokenProcessor rewrites headings and back-fills positions in place
+        # (_clean_heading / _extrapolate_agent_to_prev_token_step). That is
+        # harmless for a training loop that sees each batch once, but we
+        # tokenize the same scenario repeatedly (once per context window,
+        # once per queried agent), so we hand it copies and keep the
+        # caller's logged tensors pristine for the ground-truth comparisons.
+        with isolated_agent_time_fields(data):
+            return self.model.token_processor(data)
+
+    @property
+    def token_shift(self) -> int:
+        return _horizon_owner(self.model.encoder).shift
 
     def round_horizon(self, horizon: Optional[int]) -> Optional[int]:
         """Rounds a horizon (in 10Hz steps) up to the next whole token step,
