@@ -213,6 +213,7 @@ def build_reward_training_features(
             free_agent_indices=[obs.agent_idx],
             n_samples=n_aux,
             sampling_scheme=sampling_scheme,
+            rollout_horizon=synthesizer.round_horizon(cfg.metric_horizon),
         )
         aux_log_prob = trajectory_log_prob(
             rollouts["next_token_logits"][:, 0],
@@ -230,6 +231,7 @@ def build_reward_training_features(
             n_samples=1,
             output_agent_indices=[obs.agent_idx],
             sampling_scheme=sampling_scheme,
+            rollout_horizon=synthesizer.round_horizon(cfg.metric_horizon),
         )
         gt_log_prob = trajectory_log_prob(
             gt_scored["next_token_logits"][:, 0],

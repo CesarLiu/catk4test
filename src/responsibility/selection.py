@@ -63,6 +63,10 @@ def predict_responsibility_aware(
         free_agent_indices=[query_idx],
         n_samples=n_candidates,
         sampling_scheme=sampling_scheme,
+        # cfg.metric_horizon doubles as the prediction horizon: only those
+        # steps are scored, and an autoregressive rollout truncated early is
+        # exactly the prefix of the full-length one.
+        rollout_horizon=synthesizer.round_horizon(cfg.metric_horizon),
     )
     traj = rollouts["pred_traj_10hz"][:, 0]  # [n_candidates, T, 2]
     log_prob = trajectory_log_prob(

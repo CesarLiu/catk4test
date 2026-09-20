@@ -112,6 +112,85 @@ def remove_agents(
     return out
 
 
+# Per-agent / per-polyline tensors are replicated when a scene is copied;
+# these are shared vocabularies indexed by token, not by node, so they are not.
+_SHARED_AGENT_KEYS = {"trajectory_token_veh", "trajectory_token_ped", "trajectory_token_cyc"}
+_SHARED_MAP_KEYS = {"token_traj_src"}
+
+
+def _replicate_store(
+    store: Dict[str, Tensor], n_nodes: int, n_graphs: int, n_copies: int, shared: set
+) -> Dict[str, Tensor]:
+    out = {}
+    for key, value in store.items():
+        if key in shared or not torch.is_tensor(value):
+            out[key] = value
+        elif key == "batch":
+            out[key] = torch.cat([value + i * n_graphs for i in range(n_copies)], dim=0)
+        elif value.shape[0] == n_nodes:
+            out[key] = value.repeat(n_copies, *([1] * (value.dim() - 1)))
+        else:
+            out[key] = value
+    return out
+
+
+def replicate_scene(
+    tokenized_map: Dict[str, Tensor],
+    tokenized_agent: Dict[str, Tensor],
+    n_copies: int,
+):
+    """Stacks ``n_copies`` independent copies of one scene into a single PyG
+    batch, so that N i.i.d. rollouts come out of one ``.inference()`` call.
+
+    SMART keys every attention edge off the ``batch`` index, so the copies
+    cannot see each other; replicating is therefore equivalent to running
+    the rollout N times, but pays the (dominant) map and attention setup
+    cost once. The memory cost is dominated by ``token_traj_all``
+    ([n_agent, n_token, 6, 4, 2]), which is why the number of copies per
+    call is capped by ``MotionSetSynthesizer.rollout_batch_size``.
+    """
+    if n_copies == 1:
+        return tokenized_map, tokenized_agent
+
+    n_graphs = int(tokenized_agent["num_graphs"])
+    n_agent = tokenized_agent["valid_mask"].shape[0]
+    n_pl = tokenized_map["position"].shape[0]
+
+    map_out = _replicate_store(tokenized_map, n_pl, n_graphs, n_copies, _SHARED_MAP_KEYS)
+    agent_out = _replicate_store(tokenized_agent, n_agent, n_graphs, n_copies, _SHARED_AGENT_KEYS)
+    agent_out["num_graphs"] = n_graphs * n_copies
+    return map_out, agent_out
+
+
+def _horizon_owner(encoder):
+    """SMARTDecoder delegates the rollout loop to its agent encoder; the
+    test double implements it directly."""
+    return getattr(encoder, "agent_encoder", encoder)
+
+
+@contextlib.contextmanager
+def temporary_rollout_horizon(encoder, horizon: Optional[int]):
+    """Temporarily shortens the autoregressive rollout to ``horizon`` steps
+    (at 10Hz). Because the rollout is autoregressive, stopping early yields
+    exactly the prefix of a full-length rollout, so this is a pure compute
+    saving whenever only the first few seconds are scored."""
+    owner = _horizon_owner(encoder)
+    if horizon is None:
+        yield
+        return
+
+    shift = owner.shift
+    if horizon <= 0 or horizon % shift != 0:
+        raise ValueError(f"rollout_horizon must be a positive multiple of {shift}, got {horizon}")
+
+    original = owner.num_future_steps
+    owner.num_future_steps = min(horizon, original)
+    try:
+        yield
+    finally:
+        owner.num_future_steps = original
+
+
 def find_neighbors(
     position: Tensor,  # [n_agent, n_step, 2]
     valid_mask: Tensor,  # [n_agent, n_step]
@@ -134,15 +213,29 @@ def find_neighbors(
 class MotionSetSynthesizer:
     """Draws counterfactual motion sets from a (loaded, ``eval()``-mode) SMART model."""
 
-    def __init__(self, model, default_sampling_scheme: DictConfig):
+    def __init__(
+        self,
+        model,
+        default_sampling_scheme: DictConfig,
+        rollout_batch_size: int = 8,
+    ):
         if model.training:
             raise ValueError("SMART model must be in eval() mode for rollout sampling.")
         self.model = model
         self.default_sampling_scheme = default_sampling_scheme
+        self.rollout_batch_size = max(1, rollout_batch_size)
 
     @torch.no_grad()
     def tokenize(self, data):
         return self.model.token_processor(data)
+
+    def round_horizon(self, horizon: Optional[int]) -> Optional[int]:
+        """Rounds a horizon (in 10Hz steps) up to the next whole token step,
+        which is the granularity the rollout loop can stop at."""
+        if horizon is None:
+            return None
+        shift = _horizon_owner(self.model.encoder).shift
+        return max(shift, -(-int(horizon) // shift) * shift)
 
     @torch.no_grad()
     def sample_rollouts(
@@ -154,6 +247,7 @@ class MotionSetSynthesizer:
         remove_agent_indices: Optional[Sequence[int]] = None,
         sampling_scheme: Optional[DictConfig] = None,
         output_agent_indices: Optional[Sequence[int]] = None,
+        rollout_horizon: Optional[int] = None,
     ) -> Dict[str, Tensor]:
         """Rolls out ``n_samples`` i.i.d. counterfactual continuations for
         the agents in ``free_agent_indices``; every other (non-removed)
@@ -195,28 +289,48 @@ class MotionSetSynthesizer:
             device=device,
         )
 
+        n_agent = tokenized_agent["valid_mask"].shape[0]
+        n_out = out_idx.shape[0]
+        chunks = []
+        remaining = n_samples
+        while remaining > 0:
+            chunks.append(min(remaining, self.rollout_batch_size))
+            remaining -= chunks[-1]
+
+        collected = {k: [] for k in ("traj", "head", "logits", "idx", "valid")}
         # A fresh context (and thus a fresh _ForcedTokenSampler with its step
-        # counter reset to n_step=2) is required for *every* rollout: the
-        # sampler is stepped once per call inside .inference(), so reusing
-        # one across multiple rollouts would walk its step counter past the
-        # 18-step gt_idx/valid_mask arrays on the second and later rollouts.
-        traj_list, head_list, logits_list, idx_list, valid_list = [], [], [], [], []
-        for _ in range(n_samples):
-            with force_ground_truth_tokens(work_agent, free_mask):
-                pred = self.model.encoder.inference(tokenized_map, work_agent, scheme)
+        # counter reset to n_step=2) is required for *every* inference call:
+        # the sampler is stepped once per call inside .inference(), so reusing
+        # one across calls would walk its step counter past the 18-step
+        # gt_idx/valid_mask arrays on the second and later calls.
+        for chunk in chunks:
+            rep_map, rep_agent = replicate_scene(tokenized_map, work_agent, chunk)
+            rep_free_mask = free_mask.repeat(chunk)
+            with temporary_rollout_horizon(self.model.encoder, rollout_horizon):
+                with force_ground_truth_tokens(rep_agent, rep_free_mask):
+                    pred = self.model.encoder.inference(rep_map, rep_agent, scheme)
+
             n_future_2hz = pred["next_token_logits"].shape[1]
-            traj_list.append(pred["pred_traj_10hz"].index_select(0, out_idx))
-            head_list.append(pred["pred_head_10hz"].index_select(0, out_idx))
-            logits_list.append(pred["next_token_logits"].index_select(0, out_idx))
+            # rows of copy c live at [c*n_agent, (c+1)*n_agent)
+            copy_offsets = n_agent * torch.arange(chunk, device=device)
+            gather_idx = (out_idx.unsqueeze(0) + copy_offsets.unsqueeze(1)).reshape(-1)
+
+            def _take(tensor):
+                selected = tensor.index_select(0, gather_idx)
+                return selected.view(chunk, n_out, *tensor.shape[1:])
+
+            collected["traj"].append(_take(pred["pred_traj_10hz"]))
+            collected["head"].append(_take(pred["pred_head_10hz"]))
+            collected["logits"].append(_take(pred["next_token_logits"]))
             # realized tokens and validity, aligned with next_token_logits' steps
-            idx_list.append(pred["pred_idx"].index_select(0, out_idx)[:, 2 : 2 + n_future_2hz])
-            valid_list.append(pred["next_token_valid"].index_select(0, out_idx)[:, :n_future_2hz])
+            collected["idx"].append(_take(pred["pred_idx"])[..., 2 : 2 + n_future_2hz])
+            collected["valid"].append(_take(pred["next_token_valid"])[..., :n_future_2hz])
 
         return {
-            "pred_traj_10hz": torch.stack(traj_list, dim=0),
-            "pred_head_10hz": torch.stack(head_list, dim=0),
-            "next_token_logits": torch.stack(logits_list, dim=0),
-            "next_token_idx": torch.stack(idx_list, dim=0),
-            "next_token_valid": torch.stack(valid_list, dim=0),
+            "pred_traj_10hz": torch.cat(collected["traj"], dim=0),
+            "pred_head_10hz": torch.cat(collected["head"], dim=0),
+            "next_token_logits": torch.cat(collected["logits"], dim=0),
+            "next_token_idx": torch.cat(collected["idx"], dim=0),
+            "next_token_valid": torch.cat(collected["valid"], dim=0),
             "output_agent_indices": out_idx,
         }

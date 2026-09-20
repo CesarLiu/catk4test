@@ -92,6 +92,30 @@ used by this repo's `WOSACMetrics`.
   paper's stated scope; pass `--agent-type -1` to include all types (the
   underlying dynamics/geometry code is not vehicle-specific).
 
+## Compute
+
+Responsibility is expensive: per queried agent it is `n_safety_samples`
+rollouts plus `2 * n_courtesy_samples` per neighbour. Three things keep it
+tractable, all on by default:
+
+- **Batched rollouts.** `MotionSetSynthesizer` stacks `rollout_batch_size`
+  copies of the scene into one PyG batch, so N i.i.d. rollouts come out of
+  one `.inference()` call (SMART keys every attention edge off the batch
+  index, so copies cannot see each other). Raise `--rollout-batch-size`
+  for speed, lower it if the GPU runs out of memory -- the cost is
+  dominated by `token_traj_all`, roughly 12 MB per scene copy for 32
+  agents.
+- **Truncated rollouts.** Only `metric_horizon` steps are ever scored, and
+  an autoregressive rollout stopped early is exactly the prefix of a full
+  one, so the metric paths roll out 2 s instead of 8 s.
+- **Skipped courtesy pairs.** Pairs further apart than
+  `courtesy_skip_distance` have a provably zero Boltzmann KL and are
+  skipped before any rollout.
+
+Start with `--max-scenarios` on a small slice and check that the
+safety/courtesy distributions look like the paper's Fig. 2 (most mass near
+the origin) before launching a full sweep.
+
 ## Pipeline
 
 ```bash

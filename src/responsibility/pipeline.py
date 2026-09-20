@@ -100,12 +100,15 @@ def compute_dataset_responsibility(
     max_agents_per_scenario: Optional[int] = None,
     max_scenarios: Optional[int] = None,
     keep_data: bool = True,
+    rollout_batch_size: int = 8,
 ) -> Tuple[List[ResponsibilityObservation], Dict[str, object]]:
     """Runs Sec. III's counterfactual responsibility pipeline over every
     scenario in ``dataloader``. Returns the flat observation list and (if
     ``keep_data``) a ``scenario_id -> data`` dict for reuse when building
     the reward-network training features later."""
-    synthesizer = MotionSetSynthesizer(model, sampling_scheme or default_sampling_scheme())
+    synthesizer = MotionSetSynthesizer(
+        model, sampling_scheme or default_sampling_scheme(), rollout_batch_size=rollout_batch_size
+    )
     observations: List[ResponsibilityObservation] = []
     data_by_scenario: Dict[str, object] = {}
 
@@ -160,8 +163,11 @@ def train_reward_stage(
     hidden_dim: int = 32,
     n_epochs: int = 300,
     lr: float = 1e-3,
+    rollout_batch_size: int = 8,
 ) -> Dict[int, RewardNetBundle]:
-    synthesizer = MotionSetSynthesizer(model, sampling_scheme or default_sampling_scheme())
+    synthesizer = MotionSetSynthesizer(
+        model, sampling_scheme or default_sampling_scheme(), rollout_batch_size=rollout_batch_size
+    )
     level_features = build_reward_training_features(
         synthesizer,
         data_by_scenario,

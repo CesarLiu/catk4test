@@ -47,6 +47,8 @@ def parse_args():
     p.add_argument("--motion-set-num-k", type=int, default=2048)
     p.add_argument("--motion-set-temp", type=float, default=1.0)
     p.add_argument("--metric-horizon", type=int, default=20)
+    p.add_argument("--rollout-batch-size", type=int, default=8,
+                   help="Scene copies per inference call; raise for speed, lower for GPU memory.")
     p.add_argument("--device", default="cpu")
     return p.parse_args()
 
@@ -87,6 +89,7 @@ def main():
         hidden_dim=args.hidden_dim,
         n_epochs=args.n_epochs,
         lr=args.lr,
+        rollout_batch_size=args.rollout_batch_size,
     )
     save_reward_nets(bundles, args.out)
     print(f"Trained reward networks for levels {sorted(bundles.keys())}. Saved to {args.out}")

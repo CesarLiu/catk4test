@@ -44,22 +44,24 @@ def test_forcing_replays_ground_truth_tokens_for_non_free_agents(sampling_scheme
     ), "the free agent must keep the sampler's own tokens"
 
 
-def test_forcing_step_counter_is_per_rollout(sampling_scheme):
+def test_forcing_step_counter_is_per_inference_call(sampling_scheme):
     """Regression: the step counter must restart at n_step=2 for every
-    rollout. Reusing one sampler across rollouts walked it past the
-    18-step gt_idx array and raised IndexError on the second rollout."""
+    ``.inference()`` call. Reusing one sampler across calls walked it past
+    the 18-step gt_idx array and raised IndexError on the second call.
+    ``rollout_batch_size=1`` forces one call per sample, which is exactly
+    the configuration that used to break."""
     model = FakeSMART(n_agent=3)
-    synth = MotionSetSynthesizer(model, sampling_scheme)
+    synth = MotionSetSynthesizer(model, sampling_scheme, rollout_batch_size=1)
     tok_map, tok_agent = make_tokenized_map(), make_tokenized_agent(3)
 
     rollouts = synth.sample_rollouts(
-        tok_map, tok_agent, free_agent_indices=[0], n_samples=3
+        tok_map, tok_agent, free_agent_indices=[0], n_samples=3, output_agent_indices=[0, 1]
     )
-    assert rollouts["next_token_idx"].shape[0] == 3
 
-    # every rollout must have forced the same GT tokens onto agents 1 and 2
-    forced_rows = [m for m in model.encoder.seen_valid_masks]
-    assert len(forced_rows) == 3
+    assert len(model.encoder.seen_valid_masks) == 3, "expected one inference call per sample"
+    expected_gt = torch.arange(FIRST_N_STEP, FIRST_N_STEP + N_FUTURE_2HZ)
+    for sample in range(3):
+        assert torch.equal(rollouts["next_token_idx"][sample, 1], expected_gt)
 
 
 def test_forcing_skips_steps_without_valid_ground_truth(sampling_scheme):

@@ -50,6 +50,7 @@ def parse_args():
     p.add_argument("--n-candidates", type=int, default=25)
     p.add_argument("--motion-set-num-k", type=int, default=2048)
     p.add_argument("--motion-set-temp", type=float, default=1.0)
+    p.add_argument("--rollout-batch-size", type=int, default=8)
     p.add_argument("--device", default="cpu")
     return p.parse_args()
 
@@ -80,7 +81,9 @@ def main():
     print(f"Scenario {data.get('scenario_id', args.scenario_index)}, queried agent index {query_idx}")
 
     synthesizer = MotionSetSynthesizer(
-        model, default_sampling_scheme(num_k=args.motion_set_num_k, temp=args.motion_set_temp)
+        model,
+        default_sampling_scheme(num_k=args.motion_set_num_k, temp=args.motion_set_temp),
+        rollout_batch_size=args.rollout_batch_size,
     )
     rcfg = ResponsibilityConfig(num_historical_steps=num_historical_steps)
 

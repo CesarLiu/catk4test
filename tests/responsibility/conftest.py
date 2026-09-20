@@ -48,6 +48,26 @@ def _stub_sample_next_token_traj(
     return next_token_idx, next_token_traj_all
 
 
+def row_indexed_sampler(
+    token_traj,
+    token_traj_all,
+    sampling_scheme,
+    next_token_logits,
+    pos_now,
+    head_now,
+    pos_next_gt,
+    head_next_gt,
+    valid_next_gt,
+    token_agent_shape,
+):
+    """Alternative stub whose token depends on the agent's row, so tests can
+    tell replicated copies of a scene apart."""
+    n_agent = next_token_logits.shape[0]
+    next_token_idx = torch.arange(n_agent) % N_TOKEN
+    next_token_traj_all = token_traj_all[torch.arange(n_agent), next_token_idx]
+    return next_token_idx, next_token_traj_all
+
+
 def _install_agent_decoder_stub():
     # `import src.smart.modules.agent_decoder as m` short-circuits on the full
     # name in sys.modules and then walks the attribute chain, so the parent

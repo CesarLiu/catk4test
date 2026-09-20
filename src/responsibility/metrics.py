@@ -150,6 +150,7 @@ def safety_responsibility(
         free_agent_indices=[query_idx],
         n_samples=cfg.n_safety_samples,
         sampling_scheme=sampling_scheme,
+        rollout_horizon=synthesizer.round_horizon(cfg.metric_horizon),
     )
     horizon = effective_horizon(data, cfg, rollouts["pred_traj_10hz"].shape[2])
     sampled_traj_a = rollouts["pred_traj_10hz"][:, 0, :horizon]  # [N, H, 2]
@@ -238,6 +239,7 @@ def courtesy_responsibility_pair(
         n_samples=cfg.n_courtesy_samples,
         remove_agent_indices=None,
         sampling_scheme=sampling_scheme,
+        rollout_horizon=synthesizer.round_horizon(cfg.metric_horizon),
     )
     rollouts_without = synthesizer.sample_rollouts(
         tokenized_map,
@@ -246,6 +248,7 @@ def courtesy_responsibility_pair(
         n_samples=cfg.n_courtesy_samples,
         remove_agent_indices=[query_idx],
         sampling_scheme=sampling_scheme,
+        rollout_horizon=synthesizer.round_horizon(cfg.metric_horizon),
     )
 
     horizon = effective_horizon(data, cfg, rollouts_with["pred_traj_10hz"].shape[2])

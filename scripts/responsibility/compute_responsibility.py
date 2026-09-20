@@ -48,6 +48,8 @@ def parse_args():
     p.add_argument("--drivable-half-width", type=float, default=3.0)
     p.add_argument("--motion-set-num-k", type=int, default=2048)
     p.add_argument("--motion-set-temp", type=float, default=1.0)
+    p.add_argument("--rollout-batch-size", type=int, default=8,
+                   help="Scene copies per inference call; raise for speed, lower for GPU memory.")
     p.add_argument("--device", default="cpu")
     return p.parse_args()
 
@@ -83,6 +85,7 @@ def main():
         agent_type_filter=agent_type_filter,
         max_agents_per_scenario=args.max_agents_per_scenario,
         max_scenarios=args.max_scenarios,
+        rollout_batch_size=args.rollout_batch_size,
         keep_data=False,
     )
     save_observations(observations, args.out)
