@@ -66,6 +66,12 @@ def parse_args():
     p.add_argument("--motion-set-num-k", type=int, default=2048)
     p.add_argument("--motion-set-temp", type=float, default=1.0)
     p.add_argument("--rollout-batch-size", type=int, default=8)
+    p.add_argument("--neighbor-future", default="logged",
+                   choices=["logged", "hidden", "simulated"],
+                   help="How much of the neighbours' future the queried agent may "
+                        "condition on: logged (they replay their log and stay visible), "
+                        "hidden (visible only up to the current step; the paper's "
+                        "open-loop reading), simulated (nobody is teacher-forced).")
     p.add_argument("--device", default="cpu")
     return p.parse_args()
 
@@ -91,6 +97,7 @@ def main():
         num_historical_steps=num_historical_steps,
         metric_horizon=args.metric_horizon,
         window_stride=args.window_stride,
+        neighbor_future=args.neighbor_future,
     )
     synthesizer = MotionSetSynthesizer(
         model,

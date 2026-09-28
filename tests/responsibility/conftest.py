@@ -144,18 +144,36 @@ class FakeEncoder:
         self.shift = SHIFT
         self.seen_valid_masks = []  # one entry per inference() call
         self.seen_n_agent = []
+        self.seen_a2a_masks = []  # one entry per rollout step
+
+    def build_interaction_edge(self, pos_a, head_a, head_vector_a, batch_s, mask):
+        """Same call convention as SMARTAgentDecoder's; we only record the
+        agent-agent visibility mask so tests can see who was reachable."""
+        self.seen_a2a_masks.append(mask.clone())
+        return torch.zeros(2, 0, dtype=torch.long), torch.zeros(0, 1)
 
     def inference(self, tokenized_map, tokenized_agent, sampling_scheme):
         n_agent = tokenized_agent["valid_mask"].shape[0]
         n_future_2hz = self.num_future_steps // self.shift
         self.seen_valid_masks.append(tokenized_agent["valid_mask"].clone())
         self.seen_n_agent.append(n_agent)
+        step_current_2hz = 2
 
         pred_idx = tokenized_agent["gt_idx"].clone()
         pred_valid = tokenized_agent["valid_mask"].clone()
         logits = []
         for t in range(n_future_2hz):
             n_step = FIRST_N_STEP + t
+            # mirrors the real decoder: the first call spans the history
+            # steps, later ones only the newest step
+            hist_step = step_current_2hz if t == 0 else 1
+            self.build_interaction_edge(
+                pos_a=torch.zeros(n_agent, hist_step, 2),
+                head_a=torch.zeros(n_agent, hist_step),
+                head_vector_a=torch.zeros(n_agent, hist_step, 2),
+                batch_s=tokenized_agent["batch"].repeat(hist_step),
+                mask=pred_valid[:, :hist_step],
+            )
             next_token_logits = torch.zeros(n_agent, N_TOKEN)
             next_token_idx, _ = AGENT_DECODER_STUB.sample_next_token_traj(
                 token_traj=tokenized_agent["token_traj"],

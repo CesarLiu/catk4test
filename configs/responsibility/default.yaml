@@ -18,6 +18,13 @@ window_stride: 5 # spacing (10Hz steps) between the context steps swept within o
 # clip; each step yields one beta, so a clip gives a sequence the HMM's
 # transition matrix can actually be fitted on
 num_historical_steps: 11 # must match the checkpoint's decoder.num_historical_steps
+neighbor_future: logged # {logged, hidden, simulated}: how much of the neighbours' future
+# the queried agent conditions on while its alternatives are sampled.
+# "logged" replays their log and keeps them visible -- faithful to
+# "b replays its log", but the queried agent then foresees the real
+# scene, which biases safety responsibility upward. "hidden" keeps
+# them visible only up to the current step (the paper's Sec. VI-A
+# open-loop reading). "simulated" teacher-forces nobody.
 n_collision_circles: 3 # circles per vehicle footprint; 1 would make adjacent lanes collide
 collision_margin: 0.0 # extra meters added to the combined-radius collision threshold
 collision_weight: 10.0 # weight on collision cost in R = -10*c_coll - c_dev (Sec. V-B)

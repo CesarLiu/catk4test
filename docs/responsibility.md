@@ -89,6 +89,17 @@ used by this repo's `WOSACMetrics`.
   zero (the two rewards differ only in the collision term against the
   queried agent). This is a compute shortcut with no effect on the
   non-zero values; set it to `0` to disable.
+- **How much future the queried agent sees is a switch**
+  (`neighbor_future`, default `logged`). SMART rebuilds its interaction
+  graph from the agents' current poses at every rollout step, so a
+  neighbour teacher-forced onto its log leaks its *realized* future to
+  the agent whose alternatives we are sampling. That is more information
+  than the paper's open-loop assumption ("their controls do not change
+  even after observing other agents' future states", Sec. VI-A) and it
+  biases safety responsibility upward: forewarned alternatives avoid the
+  neighbour more easily, inflating `D_g(xi) - D_g(xi_a)`, and worst
+  exactly in the interactive scenes one cares about. The three modes are
+  described under "Open-loop modes" below.
 - **Levels used online are causal.** beta at context step k is computed
   from the logged future over [k+1, k+metric_horizon], so it is only known
   at k+metric_horizon. The online selection path therefore takes its
@@ -102,6 +113,37 @@ used by this repo's `WOSACMetrics`.
 - **Vehicle-vehicle only by default** (`agent_type_filter=0`), matching the
   paper's stated scope; pass `--agent-type -1` to include all types (the
   underlying dynamics/geometry code is not vehicle-specific).
+
+## Open-loop modes
+
+`--neighbor-future` selects what the queried agent conditions on while
+its counterfactual alternatives are drawn. Only the *conditioning*
+changes: safety responsibility is always measured against the neighbour's
+logged trajectory, as Eq. (2)-(3) require.
+
+| mode | neighbours do | queried agent sees | note |
+|---|---|---|---|
+| `logged` (default) | replay their logged tokens | their whole realized future | faithful to "b replays its log"; the agent is better informed than the paper assumes, which inflates beta_safety |
+| `hidden` | replay their logged tokens | them only up to the current step | the paper's stated open-loop reading: decide on the current state and the interaction history |
+| `simulated` | sample their own futures | a plausible simulated future | no privileged information and fully in distribution, but the neighbours' motion is a sample, not the log |
+
+`hidden` is implemented by cutting the hidden agents' agent-agent
+attention edges from the second rollout step onward
+(`motion_set.hide_agents_after_current_step`); the first step spans the
+history and is left intact, so the agent keeps what it encoded about its
+neighbours at time k and simply stops receiving updates.
+
+Running the same slice under two modes and differencing gives a reading
+the paper does not have: the gap between `logged` and `hidden` is how
+much of the apparent safety margin was actually supplied by the queried
+agent being able to anticipate its neighbours, rather than by its own
+caution.
+
+```bash
+for mode in logged hidden simulated; do
+  python -m scripts.responsibility.compute_responsibility       --ckpt /path/to/smart.ckpt --data-root /path/to/cache/validation       --neighbor-future $mode --max-scenarios 50       --out logs/responsibility/observations_$mode.pkl
+done
+```
 
 ## Compute
 

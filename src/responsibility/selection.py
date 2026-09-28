@@ -67,6 +67,7 @@ def predict_responsibility_aware(
         # steps are scored, and an autoregressive rollout truncated early is
         # exactly the prefix of the full-length one.
         rollout_horizon=synthesizer.round_horizon(cfg.metric_horizon),
+        neighbor_future=cfg.neighbor_future,
     )
     traj = rollouts["pred_traj_10hz"][:, 0]  # [n_candidates, T, 2]
     log_prob = trajectory_log_prob(

@@ -38,6 +38,7 @@ from src.responsibility.metrics import (
     rollout_boxes,
 )
 from src.responsibility.motion_set import (
+    NEIGHBOR_FUTURE_LOGGED,
     MotionSetSynthesizer,
     find_neighbors,
     shifted_context,
@@ -311,6 +312,7 @@ def _features_for_observation(
         n_samples=n_aux,
         sampling_scheme=sampling_scheme,
         rollout_horizon=horizon_arg,
+        neighbor_future=cfg.neighbor_future,
     )
     aux_log_prob = trajectory_log_prob(
         rollouts["next_token_logits"][:, 0],
@@ -329,6 +331,9 @@ def _features_for_observation(
         output_agent_indices=[obs.agent_idx],
         sampling_scheme=sampling_scheme,
         rollout_horizon=horizon_arg,
+        # must stay teacher-forced: this pass exists to score the *logged*
+        # trajectory, which only replays under "logged"
+        neighbor_future=NEIGHBOR_FUTURE_LOGGED,
     )
     gt_log_prob = trajectory_log_prob(
         gt_scored["next_token_logits"][:, 0],

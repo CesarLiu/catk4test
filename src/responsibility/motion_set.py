@@ -220,6 +220,62 @@ def shifted_context(data, k: int, num_historical_steps: int):
             store[field] = value
 
 
+# How much of the other agents' future the queried agent is allowed to
+# condition on while its counterfactual alternatives are sampled.
+NEIGHBOR_FUTURE_LOGGED = "logged"
+NEIGHBOR_FUTURE_HIDDEN = "hidden"
+NEIGHBOR_FUTURE_SIMULATED = "simulated"
+NEIGHBOR_FUTURE_MODES = (
+    NEIGHBOR_FUTURE_LOGGED,
+    NEIGHBOR_FUTURE_HIDDEN,
+    NEIGHBOR_FUTURE_SIMULATED,
+)
+
+
+@contextlib.contextmanager
+def hide_agents_after_current_step(encoder, hidden_mask: Tensor):
+    """Cuts the agent-agent attention edges of ``hidden_mask`` agents for
+    every rollout step after the first.
+
+    ``SMARTAgentDecoder.inference`` rebuilds the interaction graph each
+    step from the agents' *current* poses, so an agent teacher-forced onto
+    its log leaks its realized future to everyone else. The first call
+    covers the history steps and is left alone; from the second on, the
+    hidden agents' rows are masked out, and since ``build_interaction_edge``
+    drops both in- and out-edges of masked agents (``subgraph``), the
+    queried agent stops receiving updates about them. It still carries
+    whatever it encoded about them at the current step, which is exactly
+    the paper's "decision based on the current state and the interaction
+    history" (Sec. VI-A).
+    """
+    owner = _horizon_owner(encoder)
+    original = owner.build_interaction_edge
+    state = {"calls": 0}
+
+    def wrapped(*args, **kwargs):
+        if "mask" not in kwargs:
+            raise RuntimeError(
+                "build_interaction_edge is expected to be called with mask=...; "
+                "its call convention changed and neighbor-future hiding would silently break"
+            )
+        step = state["calls"]
+        state["calls"] += 1
+        if step > 0:  # call 0 covers the history steps
+            mask = kwargs["mask"].clone()
+            mask[hidden_mask] = False
+            kwargs = {**kwargs, "mask": mask}
+        return original(*args, **kwargs)
+
+    owner.build_interaction_edge = wrapped
+    try:
+        yield
+    finally:
+        try:
+            del owner.build_interaction_edge
+        except AttributeError:
+            owner.build_interaction_edge = original
+
+
 def _horizon_owner(encoder):
     """SMARTDecoder delegates the rollout loop to its agent encoder; the
     test double implements it directly."""
@@ -317,6 +373,7 @@ class MotionSetSynthesizer:
         sampling_scheme: Optional[DictConfig] = None,
         output_agent_indices: Optional[Sequence[int]] = None,
         rollout_horizon: Optional[int] = None,
+        neighbor_future: str = NEIGHBOR_FUTURE_LOGGED,
     ) -> Dict[str, Tensor]:
         """Rolls out ``n_samples`` i.i.d. counterfactual continuations for
         the agents in ``free_agent_indices``; every other (non-removed)
@@ -328,7 +385,24 @@ class MotionSetSynthesizer:
         ``output_agent_indices`` selects whose rollouts are returned, in the
         given order; it defaults to ``free_agent_indices``. Passing an empty
         ``free_agent_indices`` with an explicit output agent scores that
-        agent's logged trajectory under teacher forcing.
+        agent's logged trajectory under teacher forcing (which requires
+        ``neighbor_future="logged"``).
+
+        ``neighbor_future`` controls how much of the other agents' future
+        the free agents may condition on:
+
+        - ``"logged"``   they replay their logged tokens and stay visible,
+          so the free agent effectively foresees the real scene evolution.
+          Faithful to "b replays its log", but more informed than the
+          paper's open-loop assumption; biases safety responsibility up.
+        - ``"hidden"``   they replay their logged tokens but drop out of
+          the interaction graph after the current step, so the free agent
+          decides on the current state and interaction history alone
+          (the paper's stated open-loop reading, Sec. VI-A).
+        - ``"simulated"`` nothing is teacher-forced: every agent samples
+          its own future. No privileged information and fully in
+          distribution, but the neighbours' realized motion is then a
+          sample rather than the log.
 
         Returns a dict of tensors indexed [n_samples, n_output_agent, ...]:
             pred_traj_10hz:    [n_samples, n_free_agent, 80, 2]
@@ -340,6 +414,10 @@ class MotionSetSynthesizer:
                 model log-probability, see reward_model.trajectory_log_prob)
             next_token_valid:  [n_samples, n_free_agent, 16]
         """
+        if neighbor_future not in NEIGHBOR_FUTURE_MODES:
+            raise ValueError(
+                f"neighbor_future must be one of {NEIGHBOR_FUTURE_MODES}, got {neighbor_future!r}"
+            )
         n_agent = tokenized_agent["valid_mask"].shape[0]
         device = tokenized_agent["valid_mask"].device
         free_mask = torch.zeros(n_agent, dtype=torch.bool, device=device)
@@ -375,9 +453,15 @@ class MotionSetSynthesizer:
         for chunk in chunks:
             rep_map, rep_agent = replicate_scene(tokenized_map, work_agent, chunk)
             rep_free_mask = free_mask.repeat(chunk)
-            with temporary_rollout_horizon(self.model.encoder, rollout_horizon):
-                with force_ground_truth_tokens(rep_agent, rep_free_mask):
-                    pred = self.model.encoder.inference(rep_map, rep_agent, scheme)
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(temporary_rollout_horizon(self.model.encoder, rollout_horizon))
+                if neighbor_future != NEIGHBOR_FUTURE_SIMULATED:
+                    stack.enter_context(force_ground_truth_tokens(rep_agent, rep_free_mask))
+                if neighbor_future == NEIGHBOR_FUTURE_HIDDEN:
+                    stack.enter_context(
+                        hide_agents_after_current_step(self.model.encoder, ~rep_free_mask)
+                    )
+                pred = self.model.encoder.inference(rep_map, rep_agent, scheme)
 
             n_future_2hz = pred["next_token_logits"].shape[1]
             # rows of copy c live at [c*n_agent, (c+1)*n_agent)

@@ -1,3 +1,7 @@
 **/__pycache__/
 **/*.pyc
 **/logs
+# model checkpoints: large binaries, and the Waymo Open Motion Dataset
+# terms do not allow redistributing models trained on it (see README)
+ckpts/
+**/*.ckpt

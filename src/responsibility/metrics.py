@@ -16,7 +16,7 @@ from src.responsibility.geometry import (
     pairwise_min_distance_over_time,
     road_deviation_cost,
 )
-from src.responsibility.motion_set import MotionSetSynthesizer
+from src.responsibility.motion_set import NEIGHBOR_FUTURE_LOGGED, MotionSetSynthesizer
 from src.responsibility.risk import cvar
 
 
@@ -44,6 +44,12 @@ class ResponsibilityConfig:
     # Must match the loaded checkpoint's decoder.num_historical_steps; it
     # defines where the logged future starts.
     num_historical_steps: int = 11
+    # How much of the neighbours' future the queried agent may condition on
+    # while its alternatives are sampled; see motion_set.NEIGHBOR_FUTURE_MODES.
+    # "logged" is faithful to "b replays its log" but lets the queried agent
+    # foresee the real scene, which biases safety responsibility upward;
+    # "hidden" is the paper's stated open-loop reading.
+    neighbor_future: str = NEIGHBOR_FUTURE_LOGGED
     n_collision_circles: int = 3
     collision_margin: float = 0.0
     collision_weight: float = 10.0  # matches paper's R = -10*c_coll - c_dev
@@ -155,6 +161,7 @@ def safety_responsibility(
         n_samples=cfg.n_safety_samples,
         sampling_scheme=sampling_scheme,
         rollout_horizon=synthesizer.round_horizon(cfg.metric_horizon),
+        neighbor_future=cfg.neighbor_future,
     )
     horizon = effective_horizon(data, cfg, rollouts["pred_traj_10hz"].shape[2])
     sampled_traj_a = rollouts["pred_traj_10hz"][:, 0, :horizon]  # [N, H, 2]
@@ -244,6 +251,7 @@ def courtesy_responsibility_pair(
         remove_agent_indices=None,
         sampling_scheme=sampling_scheme,
         rollout_horizon=synthesizer.round_horizon(cfg.metric_horizon),
+        neighbor_future=cfg.neighbor_future,
     )
     rollouts_without = synthesizer.sample_rollouts(
         tokenized_map,
@@ -253,6 +261,7 @@ def courtesy_responsibility_pair(
         remove_agent_indices=[query_idx],
         sampling_scheme=sampling_scheme,
         rollout_horizon=synthesizer.round_horizon(cfg.metric_horizon),
+        neighbor_future=cfg.neighbor_future,
     )
 
     horizon = effective_horizon(data, cfg, rollouts_with["pred_traj_10hz"].shape[2])

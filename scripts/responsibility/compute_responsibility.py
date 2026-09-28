@@ -54,6 +54,12 @@ def parse_args():
     p.add_argument("--motion-set-temp", type=float, default=1.0)
     p.add_argument("--rollout-batch-size", type=int, default=8,
                    help="Scene copies per inference call; raise for speed, lower for GPU memory.")
+    p.add_argument("--neighbor-future", default="logged",
+                   choices=["logged", "hidden", "simulated"],
+                   help="How much of the neighbours' future the queried agent may "
+                        "condition on: logged (they replay their log and stay visible), "
+                        "hidden (visible only up to the current step; the paper's "
+                        "open-loop reading), simulated (nobody is teacher-forced).")
     p.add_argument("--device", default="cpu")
     return p.parse_args()
 
@@ -76,6 +82,7 @@ def main():
             args.courtesy_skip_distance if args.courtesy_skip_distance > 0 else None
         ),
         num_historical_steps=hydra_cfg.model.model_config.decoder.num_historical_steps,
+        neighbor_future=args.neighbor_future,
         collision_weight=args.collision_weight,
         drivable_half_width=args.drivable_half_width,
     )
