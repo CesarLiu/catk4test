@@ -167,7 +167,7 @@ def compute_dataset_responsibility(
     max_agents_per_scenario: Optional[int] = None,
     max_scenarios: Optional[int] = None,
     keep_data: bool = True,
-    rollout_batch_size: int = 8,
+    rollout_batch_size: Optional[int] = None,
     sweep_windows: bool = True,
 ) -> Tuple[List[ResponsibilityObservation], Dict[str, object]]:
     """Runs Sec. III's counterfactual responsibility pipeline over every
@@ -241,7 +241,7 @@ def train_reward_stage(
     hidden_dim: int = 32,
     n_epochs: int = 300,
     lr: float = 1e-3,
-    rollout_batch_size: int = 8,
+    rollout_batch_size: Optional[int] = None,
 ) -> Dict[int, RewardNetBundle]:
     synthesizer = MotionSetSynthesizer(
         model, sampling_scheme or default_sampling_scheme(), rollout_batch_size=rollout_batch_size

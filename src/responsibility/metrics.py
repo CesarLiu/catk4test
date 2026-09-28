@@ -3,8 +3,8 @@ tractable Boltzmann approximation to courtesy responsibility from Sec. V-B,
 Eq. 7, which we use in place of the intractable exact KL of Eq. 4).
 """
 
-from dataclasses import dataclass
-from typing import Dict, Optional, Sequence
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -16,7 +16,12 @@ from src.responsibility.geometry import (
     pairwise_min_distance_over_time,
     road_deviation_cost,
 )
-from src.responsibility.motion_set import NEIGHBOR_FUTURE_LOGGED, MotionSetSynthesizer
+from src.responsibility.motion_set import (
+    NEIGHBOR_FUTURE_LOGGED,
+    MotionSetSynthesizer,
+    RolloutJob,
+    take_samples,
+)
 from src.responsibility.risk import cvar
 
 
@@ -139,49 +144,38 @@ def safety_responsibility_pair(
     return cvar(decrease, alpha)
 
 
-def safety_responsibility(
-    synthesizer: MotionSetSynthesizer,
+def _zero(data) -> Tensor:
+    return torch.zeros((), device=data["agent"]["position"].device)
+
+
+# ---------------------------------------------------------------------------
+# Metrics from already-drawn rollouts (no model calls)
+# ---------------------------------------------------------------------------
+
+
+def safety_from_rollouts(
+    rollouts: Dict[str, Tensor],
     data,
-    tokenized_map: Dict[str, Tensor],
-    tokenized_agent: Dict[str, Tensor],
     query_idx: int,
     neighbor_indices: Sequence[int],
     cfg: ResponsibilityConfig,
-    sampling_scheme=None,
 ) -> Dict:
-    """beta^safety_k(a, x_k), Eq. (5): worst-case (max) safety responsibility
-    of ``query_idx`` over all its neighbors."""
+    """beta^safety_k(a, x_k), Eq. (3)+(5), from the queried agent's motion
+    set ``rollouts`` (one free agent, drawn in the full scene)."""
     if len(neighbor_indices) == 0:
-        return {"per_neighbor": {}, "value": torch.zeros((), device=data["agent"]["position"].device)}
+        return {"per_neighbor": {}, "value": _zero(data)}
 
-    rollouts = synthesizer.sample_rollouts(
-        tokenized_map,
-        tokenized_agent,
-        free_agent_indices=[query_idx],
-        n_samples=cfg.n_safety_samples,
-        sampling_scheme=sampling_scheme,
-        rollout_horizon=synthesizer.round_horizon(cfg.metric_horizon),
-        neighbor_future=cfg.neighbor_future,
-    )
     horizon = effective_horizon(data, cfg, rollouts["pred_traj_10hz"].shape[2])
     sampled_traj_a = rollouts["pred_traj_10hz"][:, 0, :horizon]  # [N, H, 2]
-
     gt_a = ground_truth_boxes(data, [query_idx], cfg.num_historical_steps, horizon)
     gt_nb = ground_truth_boxes(data, list(neighbor_indices), cfg.num_historical_steps, horizon)
 
     per_neighbor = {}
     for i, b in enumerate(neighbor_indices):
         per_neighbor[int(b)] = safety_responsibility_pair(
-            sampled_traj_a,
-            gt_a.pos[0],
-            gt_nb.pos[i],
-            gt_nb.valid[i],
-            cfg.cvar_alpha,
-            d_sat=cfg.d_sat,
+            sampled_traj_a, gt_a.pos[0], gt_nb.pos[i], gt_nb.valid[i], cfg.cvar_alpha, d_sat=cfg.d_sat
         )
-
-    value = torch.stack(list(per_neighbor.values())).max()
-    return {"per_neighbor": per_neighbor, "value": value}
+    return {"per_neighbor": per_neighbor, "value": torch.stack(list(per_neighbor.values())).max()}
 
 
 def _boltzmann_log_prob(reward: Tensor) -> Tensor:  # [N] -> [N]
@@ -194,14 +188,227 @@ def _reward_against_neighbors(
     map_points: Optional[Tensor],
     cfg: ResponsibilityConfig,
 ) -> Tensor:  # [N]
-    c_coll = collision_cost(
-        ego, others, n_circles=cfg.n_collision_circles, margin=cfg.collision_margin
-    )
+    c_coll = collision_cost(ego, others, n_circles=cfg.n_collision_circles, margin=cfg.collision_margin)
     if map_points is not None and map_points.numel() > 0:
         c_dev = road_deviation_cost(ego.pos, ego.valid, map_points, cfg.drivable_half_width)
     else:
         c_dev = torch.zeros_like(c_coll)
     return -cfg.collision_weight * c_coll - c_dev
+
+
+def _empty_boxes(like: Tensor, horizon: int) -> BoxTrajectories:
+    return BoxTrajectories(
+        pos=like.new_zeros(0, horizon, 2),
+        heading=like.new_zeros(0, horizon),
+        valid=torch.zeros(0, horizon, dtype=torch.bool, device=like.device),
+        length=like.new_zeros(0),
+        width=like.new_zeros(0),
+    )
+
+
+def courtesy_is_trivially_zero(data, query_idx: int, target_idx: int, cfg: ResponsibilityConfig) -> bool:
+    """True when the Boltzmann courtesy of (a, b) is provably 0 without any
+    rollout: no usable horizon, or the two agents stay further apart than
+    ``courtesy_skip_distance`` (the two rewards then differ in nothing)."""
+    horizon = effective_horizon(data, cfg)
+    if horizon == 0:
+        return True
+    if cfg.courtesy_skip_distance is None:
+        return False
+    gt_pair = ground_truth_boxes(data, [query_idx, target_idx], cfg.num_historical_steps, horizon)
+    separation = pairwise_min_distance_over_time(
+        gt_pair.pos[0].unsqueeze(0), gt_pair.pos[1], valid_b=gt_pair.valid[1]
+    ).squeeze(0)
+    return bool(separation > cfg.courtesy_skip_distance)
+
+
+def courtesy_from_rollouts(
+    with_rollouts: Dict[str, Tensor],
+    without_rollouts: Dict[str, Tensor],
+    data,
+    query_idx: int,
+    target_idx: int,
+    all_agent_indices: Sequence[int],
+    cfg: ResponsibilityConfig,
+    map_points: Optional[Tensor] = None,
+) -> Tensor:  # scalar
+    """beta^courtesy_k(a, b, x_k) per Sec. V-B / Eq. (7), from target b's
+    rollouts drawn with (``with_rollouts``) and without a in the scene.
+
+    The two Boltzmann distributions live on the *pooled* sample of b's
+    motions and differ only in whether a's logged trajectory enters b's
+    collision cost -- so this measures "how much a's motion blocks b's
+    plausible options", not a change in the model's conditional
+    distribution itself.
+    """
+    zero = _zero(data)
+    horizon = effective_horizon(data, cfg, with_rollouts["pred_traj_10hz"].shape[2])
+    other_with = [i for i in all_agent_indices if i != target_idx]
+    if horizon == 0 or len(other_with) == 0:
+        return zero
+    other_without = [i for i in other_with if i != query_idx]
+
+    pooled = {
+        key: torch.cat([with_rollouts[key], without_rollouts[key]], dim=0)
+        for key in ("pred_traj_10hz", "pred_head_10hz")
+    }
+    ego = rollout_boxes(pooled, 0, data["agent"]["shape"][target_idx], horizon)
+    nb_with = ground_truth_boxes(data, other_with, cfg.num_historical_steps, horizon)
+    nb_without = (
+        ground_truth_boxes(data, other_without, cfg.num_historical_steps, horizon)
+        if other_without
+        else _empty_boxes(ego.pos, horizon)
+    )
+
+    log_p1 = _boltzmann_log_prob(_reward_against_neighbors(ego, nb_with, map_points, cfg))
+    log_p2 = _boltzmann_log_prob(_reward_against_neighbors(ego, nb_without, map_points, cfg))
+    return (log_p1.exp() * (log_p1 - log_p2)).sum().clamp(min=0.0)
+
+
+# ---------------------------------------------------------------------------
+# Planning: every rollout a context window needs, shared and packed
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ResponsibilityPlan:
+    """The rollout jobs responsibility needs for one context window.
+
+    Two sharings make this much cheaper than asking per agent and per pair:
+
+    - An agent's *full-scene* motion set (it free, nobody removed) is the
+      same distribution whether it serves as the queried agent's safety
+      motion set or as a target's "with a" courtesy sample -- and the
+      latter does not depend on which a is queried. So each agent gets one
+      full-scene job, sized for its largest use.
+    - Only "b without a" is specific to a pair.
+
+    The cost is that an agent's safety estimate and the courtesy estimates
+    that use it as a target reuse the same draws, so their Monte-Carlo
+    errors are correlated; each is still an unbiased estimate on its own.
+    """
+
+    jobs: List[RolloutJob] = field(default_factory=list)
+    full_job: Dict[int, int] = field(default_factory=dict)  # agent -> job index
+    without_job: Dict[Tuple[int, int], int] = field(default_factory=dict)  # (a, b) -> job index
+    courtesy_targets: Dict[int, List[int]] = field(default_factory=dict)  # a -> non-trivial b
+
+    @property
+    def n_rollouts(self) -> int:
+        return sum(job.n_samples for job in self.jobs)
+
+
+def plan_responsibility_jobs(
+    data,
+    queried: Sequence[int],
+    neighbors_of: Dict[int, Sequence[int]],
+    cfg: ResponsibilityConfig,
+) -> ResponsibilityPlan:
+    plan = ResponsibilityPlan()
+    full_n: Dict[int, int] = {}
+    for a in queried:
+        neighbours = list(neighbors_of.get(a, []))
+        if not neighbours:
+            plan.courtesy_targets[a] = []
+            continue
+        full_n[a] = max(full_n.get(a, 0), cfg.n_safety_samples)
+        targets = [int(b) for b in neighbours if not courtesy_is_trivially_zero(data, a, int(b), cfg)]
+        plan.courtesy_targets[a] = targets
+        for b in targets:
+            full_n[b] = max(full_n.get(b, 0), cfg.n_courtesy_samples)
+
+    for agent, n in full_n.items():
+        plan.full_job[agent] = len(plan.jobs)
+        plan.jobs.append(RolloutJob(free=(agent,), n_samples=n))
+    for a, targets in plan.courtesy_targets.items():
+        for b in targets:
+            plan.without_job[(a, b)] = len(plan.jobs)
+            plan.jobs.append(RolloutJob(free=(b,), removed=(a,), n_samples=cfg.n_courtesy_samples))
+    return plan
+
+
+def responsibility_for_agents(
+    synthesizer: MotionSetSynthesizer,
+    data,
+    tokenized_map: Dict[str, Tensor],
+    tokenized_agent: Dict[str, Tensor],
+    queried: Sequence[int],
+    neighbors_of: Dict[int, Sequence[int]],
+    all_agent_indices: Sequence[int],
+    cfg: ResponsibilityConfig,
+    map_points: Optional[Tensor] = None,
+    sampling_scheme=None,
+) -> Tuple[Dict[int, Dict], ResponsibilityPlan]:
+    """beta = [beta^safety, beta^courtesy] for every queried agent of one
+    context window, with all the rollouts they need drawn in one packed
+    pass (see :class:`ResponsibilityPlan`)."""
+    plan = plan_responsibility_jobs(data, queried, neighbors_of, cfg)
+    results = synthesizer.run_jobs(
+        tokenized_map,
+        tokenized_agent,
+        plan.jobs,
+        sampling_scheme=sampling_scheme,
+        rollout_horizon=synthesizer.round_horizon(cfg.metric_horizon),
+        neighbor_future=cfg.neighbor_future,
+    )
+
+    zero = _zero(data)
+    out: Dict[int, Dict] = {}
+    for a in queried:
+        neighbours = [int(b) for b in neighbors_of.get(a, [])]
+        if a in plan.full_job and neighbours:
+            safety = safety_from_rollouts(
+                take_samples(results[plan.full_job[a]], cfg.n_safety_samples), data, a, neighbours, cfg
+            )
+        else:
+            safety = {"per_neighbor": {}, "value": zero}
+
+        per_neighbor = {b: zero for b in neighbours}
+        for b in plan.courtesy_targets.get(a, []):
+            per_neighbor[b] = courtesy_from_rollouts(
+                take_samples(results[plan.full_job[b]], cfg.n_courtesy_samples),
+                results[plan.without_job[(a, b)]],
+                data,
+                a,
+                b,
+                all_agent_indices,
+                cfg,
+                map_points=map_points,
+            )
+        courtesy_value = torch.stack(list(per_neighbor.values())).max() if per_neighbor else zero
+        courtesy = {"per_neighbor": per_neighbor, "value": courtesy_value}
+        out[a] = {"beta": torch.stack([safety["value"], courtesy["value"]]), "safety": safety, "courtesy": courtesy}
+    return out, plan
+
+
+# ---------------------------------------------------------------------------
+# Per-agent / per-pair entry points (each draws its own rollouts)
+# ---------------------------------------------------------------------------
+
+
+def safety_responsibility(
+    synthesizer: MotionSetSynthesizer,
+    data,
+    tokenized_map: Dict[str, Tensor],
+    tokenized_agent: Dict[str, Tensor],
+    query_idx: int,
+    neighbor_indices: Sequence[int],
+    cfg: ResponsibilityConfig,
+    sampling_scheme=None,
+) -> Dict:
+    """beta^safety_k(a, x_k), Eq. (5): worst case over the neighbours."""
+    if len(neighbor_indices) == 0:
+        return {"per_neighbor": {}, "value": _zero(data)}
+    rollouts = synthesizer.sample_rollouts(
+        tokenized_map,
+        tokenized_agent,
+        free_agent_indices=[query_idx],
+        n_samples=cfg.n_safety_samples,
+        sampling_scheme=sampling_scheme,
+        rollout_horizon=synthesizer.round_horizon(cfg.metric_horizon),
+        neighbor_future=cfg.neighbor_future,
+    )
+    return safety_from_rollouts(rollouts, data, query_idx, neighbor_indices, cfg)
 
 
 def courtesy_responsibility_pair(
@@ -215,91 +422,24 @@ def courtesy_responsibility_pair(
     cfg: ResponsibilityConfig,
     map_points: Optional[Tensor] = None,
     sampling_scheme=None,
-) -> Tensor:  # scalar
-    """beta^courtesy_k(a, b, x_k), approximated per Sec. V-B / Eq. (7): the
-    KL divergence between two Boltzmann distributions over a pooled sample
-    of target agent b's motions, induced by a reward function that does
-    (P1) / does not (P2) include queried agent a among b's neighbors.
-
-    Note what this approximation can and cannot see: the only term that
-    differs between the two rewards is b's collision cost against a, so it
-    measures "how much a's motion blocks b's plausible options", not a
-    change in the predictor's conditional distribution. See
-    ``exact_courtesy_responsibility_pair`` for the likelihood-based
-    alternative this repo's tokenized model also makes available.
-    """
-    zero = torch.zeros((), device=data["agent"]["position"].device)
-    horizon = effective_horizon(data, cfg)
-    if horizon == 0:
-        return zero
-
-    if cfg.courtesy_skip_distance is not None:
-        gt_pair = ground_truth_boxes(data, [query_idx, target_idx], cfg.num_historical_steps, horizon)
-        separation = pairwise_min_distance_over_time(
-            gt_pair.pos[0].unsqueeze(0),
-            gt_pair.pos[1],
-            valid_b=gt_pair.valid[1],
-        ).squeeze(0)
-        if separation > cfg.courtesy_skip_distance:
-            return zero
-
-    rollouts_with = synthesizer.sample_rollouts(
+) -> Tensor:
+    """beta^courtesy_k(a, b, x_k); see :func:`courtesy_from_rollouts`."""
+    if courtesy_is_trivially_zero(data, query_idx, target_idx, cfg):
+        return _zero(data)
+    with_rollouts, without_rollouts = synthesizer.run_jobs(
         tokenized_map,
         tokenized_agent,
-        free_agent_indices=[target_idx],
-        n_samples=cfg.n_courtesy_samples,
-        remove_agent_indices=None,
+        [
+            RolloutJob(free=(target_idx,), n_samples=cfg.n_courtesy_samples),
+            RolloutJob(free=(target_idx,), removed=(query_idx,), n_samples=cfg.n_courtesy_samples),
+        ],
         sampling_scheme=sampling_scheme,
         rollout_horizon=synthesizer.round_horizon(cfg.metric_horizon),
         neighbor_future=cfg.neighbor_future,
     )
-    rollouts_without = synthesizer.sample_rollouts(
-        tokenized_map,
-        tokenized_agent,
-        free_agent_indices=[target_idx],
-        n_samples=cfg.n_courtesy_samples,
-        remove_agent_indices=[query_idx],
-        sampling_scheme=sampling_scheme,
-        rollout_horizon=synthesizer.round_horizon(cfg.metric_horizon),
-        neighbor_future=cfg.neighbor_future,
+    return courtesy_from_rollouts(
+        with_rollouts, without_rollouts, data, query_idx, target_idx, all_agent_indices, cfg, map_points
     )
-
-    horizon = effective_horizon(data, cfg, rollouts_with["pred_traj_10hz"].shape[2])
-    pooled = {
-        "pred_traj_10hz": torch.cat(
-            [rollouts_with["pred_traj_10hz"], rollouts_without["pred_traj_10hz"]], dim=0
-        ),
-        "pred_head_10hz": torch.cat(
-            [rollouts_with["pred_head_10hz"], rollouts_without["pred_head_10hz"]], dim=0
-        ),
-    }
-    ego = rollout_boxes(pooled, 0, data["agent"]["shape"][target_idx], horizon)
-
-    other_with = [i for i in all_agent_indices if i != target_idx]
-    other_without = [i for i in other_with if i != query_idx]
-    if len(other_with) == 0:
-        return zero
-
-    nb_with = ground_truth_boxes(data, other_with, cfg.num_historical_steps, horizon)
-    nb_without = (
-        ground_truth_boxes(data, other_without, cfg.num_historical_steps, horizon)
-        if len(other_without) > 0
-        else BoxTrajectories(
-            pos=ego.pos.new_zeros(0, horizon, 2),
-            heading=ego.pos.new_zeros(0, horizon),
-            valid=torch.zeros(0, horizon, dtype=torch.bool, device=ego.pos.device),
-            length=ego.pos.new_zeros(0),
-            width=ego.pos.new_zeros(0),
-        )
-    )
-
-    reward_with = _reward_against_neighbors(ego, nb_with, map_points, cfg)
-    reward_without = _reward_against_neighbors(ego, nb_without, map_points, cfg)
-
-    log_p1 = _boltzmann_log_prob(reward_with)
-    log_p2 = _boltzmann_log_prob(reward_without)
-    kl = (log_p1.exp() * (log_p1 - log_p2)).sum()
-    return kl.clamp(min=0.0)
 
 
 def courtesy_responsibility(
@@ -314,27 +454,17 @@ def courtesy_responsibility(
     map_points: Optional[Tensor] = None,
     sampling_scheme=None,
 ) -> Dict:
-    """beta^courtesy_k(a, x_k), Eq. (5): worst-case courtesy responsibility
-    of ``query_idx`` over all its neighbors."""
+    """beta^courtesy_k(a, x_k), Eq. (5): worst case over the neighbours."""
     if len(neighbor_indices) == 0:
-        return {"per_neighbor": {}, "value": torch.zeros((), device=data["agent"]["position"].device)}
-
-    per_neighbor = {}
-    for b in neighbor_indices:
-        per_neighbor[int(b)] = courtesy_responsibility_pair(
-            synthesizer,
-            data,
-            tokenized_map,
-            tokenized_agent,
-            query_idx,
-            int(b),
-            all_agent_indices,
-            cfg,
-            map_points=map_points,
-            sampling_scheme=sampling_scheme,
+        return {"per_neighbor": {}, "value": _zero(data)}
+    per_neighbor = {
+        int(b): courtesy_responsibility_pair(
+            synthesizer, data, tokenized_map, tokenized_agent, query_idx, int(b),
+            all_agent_indices, cfg, map_points=map_points, sampling_scheme=sampling_scheme,
         )
-    value = torch.stack(list(per_neighbor.values())).max()
-    return {"per_neighbor": per_neighbor, "value": value}
+        for b in neighbor_indices
+    }
+    return {"per_neighbor": per_neighbor, "value": torch.stack(list(per_neighbor.values())).max()}
 
 
 def compute_agent_responsibility(
@@ -349,30 +479,18 @@ def compute_agent_responsibility(
     map_points: Optional[Tensor] = None,
     sampling_scheme=None,
 ) -> Dict[str, Tensor]:
-    """Convenience wrapper computing beta = [beta^safety, beta^courtesy] for
-    one queried agent at the current context, matching the paper's notation
-    (Sec. IV): beta_k := [beta^safety_k, beta^courtesy_k]^T."""
-    safety = safety_responsibility(
+    """beta_k := [beta^safety_k, beta^courtesy_k]^T (Sec. IV) for one queried
+    agent, drawn through the same packed plan as a whole window."""
+    results, _ = responsibility_for_agents(
         synthesizer,
         data,
         tokenized_map,
         tokenized_agent,
-        query_idx,
-        neighbor_indices,
-        cfg,
-        sampling_scheme=sampling_scheme,
-    )
-    courtesy = courtesy_responsibility(
-        synthesizer,
-        data,
-        tokenized_map,
-        tokenized_agent,
-        query_idx,
-        neighbor_indices,
+        [query_idx],
+        {query_idx: list(neighbor_indices)},
         all_agent_indices,
         cfg,
         map_points=map_points,
         sampling_scheme=sampling_scheme,
     )
-    beta = torch.stack([safety["value"], courtesy["value"]])
-    return {"beta": beta, "safety": safety, "courtesy": courtesy}
+    return results[query_idx]

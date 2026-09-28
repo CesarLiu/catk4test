@@ -22,7 +22,8 @@ reversed (mask one agent out instead of masking all-but-one).
 """
 
 import contextlib
-from typing import Dict, Optional, Sequence
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 from omegaconf import DictConfig
@@ -151,15 +152,27 @@ def replicate_scene(
     """
     if n_copies == 1:
         return tokenized_map, tokenized_agent
+    n_graphs = int(tokenized_agent["num_graphs"])
+    return replicate_map(tokenized_map, n_graphs, n_copies), replicate_agents(tokenized_agent, n_copies)
 
+
+def replicate_agents(tokenized_agent: Dict[str, Tensor], n_copies: int) -> Dict[str, Tensor]:
+    if n_copies == 1:
+        return tokenized_agent
     n_graphs = int(tokenized_agent["num_graphs"])
     n_agent = tokenized_agent["valid_mask"].shape[0]
-    n_pl = tokenized_map["position"].shape[0]
+    out = _replicate_store(tokenized_agent, n_agent, n_graphs, n_copies, _SHARED_AGENT_KEYS)
+    out["num_graphs"] = n_graphs * n_copies
+    return out
 
-    map_out = _replicate_store(tokenized_map, n_pl, n_graphs, n_copies, _SHARED_MAP_KEYS)
-    agent_out = _replicate_store(tokenized_agent, n_agent, n_graphs, n_copies, _SHARED_AGENT_KEYS)
-    agent_out["num_graphs"] = n_graphs * n_copies
-    return map_out, agent_out
+
+def replicate_map(map_store: Dict[str, Tensor], n_graphs: int, n_copies: int) -> Dict[str, Tensor]:
+    """Replicates either a tokenized map or an *encoded* map feature dict
+    (``SMARTMapDecoder``'s output: pt_token/position/orientation/batch)."""
+    if n_copies == 1:
+        return map_store
+    n_pl = map_store["position"].shape[0]
+    return _replicate_store(map_store, n_pl, n_graphs, n_copies, _SHARED_MAP_KEYS)
 
 
 AGENT_TIME_FIELDS = ("position", "heading", "velocity", "valid_mask")
@@ -324,19 +337,60 @@ def find_neighbors(
     return neighbor_mask
 
 
+@dataclass
+class RolloutJob:
+    """One group of i.i.d. counterfactual rollouts of the same scene.
+
+    free:      agents sampled from the model; everyone else (not removed)
+               is handled according to ``neighbor_future``
+    n_samples: number of rollouts
+    removed:   agents deleted from the scene (validity zeroed), i.e. x^{-a}
+    outputs:   agents whose rollouts are returned, in this order
+               (defaults to ``free``)
+    replay:    {agent: LongTensor [n_samples, n_steps]} -- force these
+               agents onto the given future tokens instead of their logged
+               ones, one sequence per sample. Used to score a trajectory
+               sampled in one context under another.
+    """
+
+    free: Tuple[int, ...]
+    n_samples: int
+    removed: Tuple[int, ...] = ()
+    outputs: Optional[Tuple[int, ...]] = None
+    replay: Optional[Dict[int, Tensor]] = None
+
+    @property
+    def output_agents(self) -> Tuple[int, ...]:
+        return self.outputs if self.outputs is not None else self.free
+
+
+def take_samples(result: Dict[str, Tensor], n: int) -> Dict[str, Tensor]:
+    """The first ``n`` samples of a rollout result."""
+    return {k: (v[:n] if k != "output_agent_indices" and torch.is_tensor(v) else v) for k, v in result.items()}
+
+
 class MotionSetSynthesizer:
     """Draws counterfactual motion sets from a (loaded, ``eval()``-mode) SMART model."""
+
+    # Scene copies per model call when none is given. Memory per copy is
+    # dominated by token_traj_all ([n_agent, 2048, 6, 4, 2] floats, ~25 MB
+    # for a 64-agent scene), so a large GPU takes a few hundred copies.
+    DEFAULT_BATCH_CPU = 8
+    DEFAULT_BATCH_GPU = 128
 
     def __init__(
         self,
         model,
         default_sampling_scheme: DictConfig,
-        rollout_batch_size: int = 8,
+        rollout_batch_size: Optional[int] = None,
     ):
         if model.training:
             raise ValueError("SMART model must be in eval() mode for rollout sampling.")
         self.model = model
         self.default_sampling_scheme = default_sampling_scheme
+        if not rollout_batch_size:
+            on_gpu = any(p.is_cuda for p in getattr(model, "parameters", lambda: [])())
+            rollout_batch_size = self.DEFAULT_BATCH_GPU if on_gpu else self.DEFAULT_BATCH_CPU
         self.rollout_batch_size = max(1, rollout_batch_size)
 
     @torch.no_grad()
@@ -414,76 +468,146 @@ class MotionSetSynthesizer:
                 model log-probability, see reward_model.trajectory_log_prob)
             next_token_valid:  [n_samples, n_free_agent, 16]
         """
+        job = RolloutJob(
+            free=tuple(free_agent_indices),
+            n_samples=n_samples,
+            removed=tuple(remove_agent_indices or ()),
+            outputs=tuple(output_agent_indices) if output_agent_indices is not None else None,
+        )
+        return self.run_jobs(
+            tokenized_map,
+            tokenized_agent,
+            [job],
+            sampling_scheme=sampling_scheme,
+            rollout_horizon=rollout_horizon,
+            neighbor_future=neighbor_future,
+            keep_logits=True,
+        )[0]
+
+    @torch.no_grad()
+    def run_jobs(
+        self,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+        jobs: Sequence[RolloutJob],
+        sampling_scheme: Optional[DictConfig] = None,
+        rollout_horizon: Optional[int] = None,
+        neighbor_future: str = NEIGHBOR_FUTURE_LOGGED,
+        keep_logits: bool = False,
+    ) -> List[Dict[str, Tensor]]:
+        """Runs many rollout jobs over one scene, packed into as few model
+        calls as possible.
+
+        Every sample of every job becomes one copy of the scene with its own
+        free / removed / replayed agents; copies are stacked
+        ``rollout_batch_size`` at a time into one PyG batch. How many
+        distinct counterfactuals a call carries is therefore independent of
+        how many samples any single one needs, which is what keeps a GPU
+        busy when a context window holds dozens of small jobs.
+
+        Returns one dict per job, shaped like :meth:`sample_rollouts`, plus
+        ``token_log_prob`` [n_samples, n_out, n_steps], the model's log-
+        probability of each realized token. Full ``next_token_logits`` are
+        only kept with ``keep_logits`` (they are 2048 wide).
+        """
         if neighbor_future not in NEIGHBOR_FUTURE_MODES:
             raise ValueError(
                 f"neighbor_future must be one of {NEIGHBOR_FUTURE_MODES}, got {neighbor_future!r}"
             )
         n_agent = tokenized_agent["valid_mask"].shape[0]
         device = tokenized_agent["valid_mask"].device
-        free_mask = torch.zeros(n_agent, dtype=torch.bool, device=device)
-        free_mask[list(free_agent_indices)] = True
-
-        work_agent = tokenized_agent
-        if remove_agent_indices:
-            work_agent = remove_agents(tokenized_agent, remove_agent_indices)
-            free_mask = free_mask.clone()
-            free_mask[list(remove_agent_indices)] = False
-
         scheme = sampling_scheme if sampling_scheme is not None else self.default_sampling_scheme
-        out_idx = torch.as_tensor(
-            list(output_agent_indices if output_agent_indices is not None else free_agent_indices),
-            dtype=torch.long,
-            device=device,
-        )
 
-        n_agent = tokenized_agent["valid_mask"].shape[0]
-        n_out = out_idx.shape[0]
-        chunks = []
-        remaining = n_samples
-        while remaining > 0:
-            chunks.append(min(remaining, self.rollout_batch_size))
-            remaining -= chunks[-1]
+        copies = [(j, s) for j, job in enumerate(jobs) for s in range(job.n_samples)]
+        keys = ["pred_traj_10hz", "pred_head_10hz", "next_token_idx", "next_token_valid", "token_log_prob"]
+        if keep_logits:
+            keys.append("next_token_logits")
+        collected = [{k: [] for k in keys} for _ in jobs]
 
-        collected = {k: [] for k in ("traj", "head", "logits", "idx", "valid")}
-        # A fresh context (and thus a fresh _ForcedTokenSampler with its step
-        # counter reset to n_step=2) is required for *every* inference call:
-        # the sampler is stepped once per call inside .inference(), so reusing
-        # one across calls would walk its step counter past the 18-step
-        # gt_idx/valid_mask arrays on the second and later calls.
-        for chunk in chunks:
-            rep_map, rep_agent = replicate_scene(tokenized_map, work_agent, chunk)
-            rep_free_mask = free_mask.repeat(chunk)
+        # The map is identical in every copy, so it is encoded once and its
+        # *features* are replicated; replicating the tokenized map instead
+        # would rerun the map encoder (and its polyline radius graph) per copy.
+        encoder = self.model.encoder
+        split = hasattr(encoder, "map_encoder") and hasattr(encoder, "agent_encoder")
+        map_feature = encoder.map_encoder(tokenized_map) if split and copies else None
+        n_graphs = int(tokenized_agent["num_graphs"])
+
+        for start in range(0, len(copies), self.rollout_batch_size):
+            chunk = copies[start : start + self.rollout_batch_size]
+            rep_agent, rep_free = self._pack_chunk(
+                tokenized_agent, [jobs[j] for j, _ in chunk], [s for _, s in chunk]
+            )
+            # A fresh context (and thus a fresh _ForcedTokenSampler with its
+            # step counter at n_step=2) is required for *every* inference call:
+            # the sampler is stepped once per step inside .inference(), so
+            # reusing one across calls would walk it past the 18-step arrays.
             with contextlib.ExitStack() as stack:
                 stack.enter_context(temporary_rollout_horizon(self.model.encoder, rollout_horizon))
                 if neighbor_future != NEIGHBOR_FUTURE_SIMULATED:
-                    stack.enter_context(force_ground_truth_tokens(rep_agent, rep_free_mask))
+                    stack.enter_context(force_ground_truth_tokens(rep_agent, rep_free))
                 if neighbor_future == NEIGHBOR_FUTURE_HIDDEN:
-                    stack.enter_context(
-                        hide_agents_after_current_step(self.model.encoder, ~rep_free_mask)
-                    )
-                pred = self.model.encoder.inference(rep_map, rep_agent, scheme)
+                    stack.enter_context(hide_agents_after_current_step(self.model.encoder, ~rep_free))
+                if split:
+                    rep_feature = replicate_map(map_feature, n_graphs, len(chunk))
+                    pred = encoder.agent_encoder.inference(rep_agent, rep_feature, scheme)
+                else:
+                    rep_map = replicate_map(tokenized_map, n_graphs, len(chunk))
+                    pred = encoder.inference(rep_map, rep_agent, scheme)
 
-            n_future_2hz = pred["next_token_logits"].shape[1]
-            # rows of copy c live at [c*n_agent, (c+1)*n_agent)
-            copy_offsets = n_agent * torch.arange(chunk, device=device)
-            gather_idx = (out_idx.unsqueeze(0) + copy_offsets.unsqueeze(1)).reshape(-1)
+            n_steps = pred["next_token_logits"].shape[1]
+            realized = pred["pred_idx"][:, 2 : 2 + n_steps]  # aligned with the logits' steps
+            token_log_prob = torch.log_softmax(pred["next_token_logits"], dim=-1).gather(
+                -1, realized.unsqueeze(-1)
+            ).squeeze(-1)
+            per_row = {
+                "pred_traj_10hz": pred["pred_traj_10hz"],
+                "pred_head_10hz": pred["pred_head_10hz"],
+                "next_token_idx": realized,
+                "next_token_valid": pred["next_token_valid"][:, :n_steps],
+                "token_log_prob": token_log_prob,
+            }
+            if keep_logits:
+                per_row["next_token_logits"] = pred["next_token_logits"]
 
-            def _take(tensor):
-                selected = tensor.index_select(0, gather_idx)
-                return selected.view(chunk, n_out, *tensor.shape[1:])
+            for c, (j, _) in enumerate(chunk):
+                rows = c * n_agent + torch.as_tensor(jobs[j].output_agents, dtype=torch.long, device=device)
+                for k in keys:
+                    collected[j][k].append(per_row[k].index_select(0, rows))
 
-            collected["traj"].append(_take(pred["pred_traj_10hz"]))
-            collected["head"].append(_take(pred["pred_head_10hz"]))
-            collected["logits"].append(_take(pred["next_token_logits"]))
-            # realized tokens and validity, aligned with next_token_logits' steps
-            collected["idx"].append(_take(pred["pred_idx"])[..., 2 : 2 + n_future_2hz])
-            collected["valid"].append(_take(pred["next_token_valid"])[..., :n_future_2hz])
+        results = []
+        for job, parts in zip(jobs, collected):
+            out = {k: torch.stack(v, dim=0) for k, v in parts.items()} if job.n_samples > 0 else {}
+            out["output_agent_indices"] = torch.as_tensor(job.output_agents, dtype=torch.long, device=device)
+            results.append(out)
+        return results
 
-        return {
-            "pred_traj_10hz": torch.cat(collected["traj"], dim=0),
-            "pred_head_10hz": torch.cat(collected["head"], dim=0),
-            "next_token_logits": torch.cat(collected["logits"], dim=0),
-            "next_token_idx": torch.cat(collected["idx"], dim=0),
-            "next_token_valid": torch.cat(collected["valid"], dim=0),
-            "output_agent_indices": out_idx,
-        }
+    def _pack_chunk(self, tokenized_agent, chunk_jobs, sample_ids):
+        """Stacks one copy of the agents per (job, sample) and applies each
+        copy's free / removed / replayed agents to its own block of rows."""
+        n_agent = tokenized_agent["valid_mask"].shape[0]
+        device = tokenized_agent["valid_mask"].device
+        n_copies = len(chunk_jobs)
+        rep_agent = dict(replicate_agents(tokenized_agent, n_copies))
+        valid = rep_agent["valid_mask"].clone()
+        gt_idx = rep_agent["gt_idx"].clone()
+        free = torch.zeros(n_copies * n_agent, dtype=torch.bool, device=device)
+
+        for c, (job, s) in enumerate(zip(chunk_jobs, sample_ids)):
+            base = c * n_agent
+            if job.free:
+                free[base + torch.as_tensor(job.free, device=device)] = True
+            if job.removed:
+                removed = base + torch.as_tensor(job.removed, device=device)
+                valid[removed] = False
+                free[removed] = False
+            for agent, tokens in (job.replay or {}).items():
+                seq = tokens[s].to(device)
+                row = base + agent
+                gt_idx[row, 2 : 2 + seq.shape[0]] = seq
+                # replayed steps must count as observed or the forcing skips them
+                valid[row, 2 : 2 + seq.shape[0]] = True
+                free[row] = False
+
+        rep_agent["valid_mask"] = valid
+        rep_agent["gt_idx"] = gt_idx
+        return rep_agent, free

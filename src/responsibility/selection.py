@@ -17,12 +17,12 @@ from src.responsibility.metrics import (
     ground_truth_boxes,
     rollout_boxes,
 )
-from src.responsibility.motion_set import MotionSetSynthesizer
+from src.responsibility.motion_set import MotionSetSynthesizer, RolloutJob
 from src.responsibility.reward_model import (
     RewardNetBundle,
     extract_trajectory_features,
+    mean_token_log_prob,
     select_best_trajectory,
-    trajectory_log_prob,
 )
 
 
@@ -57,11 +57,10 @@ def predict_responsibility_aware(
     all_idx = [i for i in range(n_agent) if i != query_idx]
     map_points = get_map_points(data)
 
-    rollouts = synthesizer.sample_rollouts(
+    (rollouts,) = synthesizer.run_jobs(
         tokenized_map,
         tokenized_agent,
-        free_agent_indices=[query_idx],
-        n_samples=n_candidates,
+        [RolloutJob(free=(query_idx,), n_samples=n_candidates)],
         sampling_scheme=sampling_scheme,
         # cfg.metric_horizon doubles as the prediction horizon: only those
         # steps are scored, and an autoregressive rollout truncated early is
@@ -70,11 +69,7 @@ def predict_responsibility_aware(
         neighbor_future=cfg.neighbor_future,
     )
     traj = rollouts["pred_traj_10hz"][:, 0]  # [n_candidates, T, 2]
-    log_prob = trajectory_log_prob(
-        rollouts["next_token_logits"][:, 0],
-        rollouts["next_token_idx"][:, 0],
-        rollouts["next_token_valid"][:, 0],
-    )
+    log_prob = mean_token_log_prob(rollouts["token_log_prob"][:, 0], rollouts["next_token_valid"][:, 0])
 
     horizon = effective_horizon(data, cfg, traj.shape[1])
     origin = data["agent"]["position"][query_idx, cfg.num_historical_steps - 1, :2]

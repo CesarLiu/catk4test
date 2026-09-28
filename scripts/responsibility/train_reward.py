@@ -48,8 +48,9 @@ def parse_args():
     p.add_argument("--motion-set-num-k", type=int, default=2048)
     p.add_argument("--motion-set-temp", type=float, default=1.0)
     p.add_argument("--metric-horizon", type=int, default=20)
-    p.add_argument("--rollout-batch-size", type=int, default=8,
-                   help="Scene copies per inference call; raise for speed, lower for GPU memory.")
+    p.add_argument("--rollout-batch-size", type=int, default=0,
+                   help="Scene copies per model call; 0 = auto (128 on GPU, 8 on CPU). "
+                        "Raise for throughput, lower on GPU out-of-memory.")
     p.add_argument("--neighbor-future", default="logged",
                    choices=["logged", "hidden", "simulated"],
                    help="How much of the neighbours' future the queried agent may "

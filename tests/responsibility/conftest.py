@@ -132,12 +132,12 @@ def make_tokenized_map(n_pl: int = 6, n_graphs: int = 1) -> dict:
     }
 
 
-class FakeEncoder:
-    """Stands in for ``SMARTDecoder``, reproducing the parts of
-    ``SMARTAgentDecoder.inference`` our wrapper depends on: one
-    ``sample_next_token_traj`` call per future step, looked up on the
-    module (not captured at import time) so monkey-patching takes effect,
-    and an output dict with the keys we consume."""
+class FakeAgentEncoder:
+    """Stands in for ``SMARTAgentDecoder``, reproducing the parts of its
+    ``inference`` our wrapper depends on: one ``sample_next_token_traj``
+    call per future step, looked up on the module (not captured at import
+    time) so monkey-patching takes effect, and an output dict with the keys
+    we consume."""
 
     def __init__(self, num_future_steps: int = N_FUTURE_2HZ * SHIFT):
         self.num_future_steps = num_future_steps
@@ -152,9 +152,16 @@ class FakeEncoder:
         self.seen_a2a_masks.append(mask.clone())
         return torch.zeros(2, 0, dtype=torch.long), torch.zeros(0, 1)
 
-    def inference(self, tokenized_map, tokenized_agent, sampling_scheme):
+    def inference(self, tokenized_agent, map_feature, sampling_scheme):
         n_agent = tokenized_agent["valid_mask"].shape[0]
         n_future_2hz = self.num_future_steps // self.shift
+        # the real decoder offsets map and agent batches by the same graph
+        # count; a mismatch here means the copies were replicated inconsistently
+        n_map_graphs = int(map_feature["batch"].max()) + 1
+        if n_map_graphs != int(tokenized_agent["num_graphs"]):
+            raise AssertionError(
+                f"map batch spans {n_map_graphs} graphs but agents claim {tokenized_agent['num_graphs']}"
+            )
         self.seen_valid_masks.append(tokenized_agent["valid_mask"].clone())
         self.seen_n_agent.append(n_agent)
         step_current_2hz = 2
@@ -206,6 +213,41 @@ class FakeEncoder:
         }
 
 
+class FakeMapEncoder:
+    """Stands in for ``SMARTMapDecoder``; counts how often the map is encoded."""
+
+    def __init__(self):
+        self.calls = 0
+        self.seen_n_pl = []
+
+    def __call__(self, tokenized_map):
+        self.calls += 1
+        n_pl = tokenized_map["position"].shape[0]
+        self.seen_n_pl.append(n_pl)
+        return {
+            "pt_token": torch.zeros(n_pl, 4),
+            "position": tokenized_map["position"],
+            "orientation": tokenized_map["orientation"],
+            "batch": tokenized_map["batch"],
+        }
+
+
+class FakeDecoder:
+    """Stands in for ``SMARTDecoder``: a map encoder plus an agent decoder.
+    Attributes not defined here are forwarded to the agent decoder, which is
+    where the rollout loop (and everything tests inspect) lives."""
+
+    def __init__(self, num_future_steps: int = N_FUTURE_2HZ * SHIFT):
+        self.map_encoder = FakeMapEncoder()
+        self.agent_encoder = FakeAgentEncoder(num_future_steps=num_future_steps)
+
+    def inference(self, tokenized_map, tokenized_agent, sampling_scheme):
+        return self.agent_encoder.inference(tokenized_agent, self.map_encoder(tokenized_map), sampling_scheme)
+
+    def __getattr__(self, name):
+        return getattr(self.__dict__["agent_encoder"], name)
+
+
 class FakeTokenProcessor:
     def __init__(self, n_agent: int = 4):
         self.n_agent = n_agent
@@ -225,7 +267,7 @@ class FakeSMART:
 
     def __init__(self, n_agent: int = 4, num_future_steps: int = N_FUTURE_2HZ * SHIFT):
         self.training = False
-        self.encoder = FakeEncoder(num_future_steps=num_future_steps)
+        self.encoder = FakeDecoder(num_future_steps=num_future_steps)
         self.token_processor = FakeTokenProcessor(n_agent)
 
 

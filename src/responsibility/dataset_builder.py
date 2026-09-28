@@ -32,7 +32,7 @@ from torch import Tensor
 from src.responsibility.hmm import GaussianHMM
 from src.responsibility.metrics import (
     ResponsibilityConfig,
-    compute_agent_responsibility,
+    responsibility_for_agents,
     effective_horizon,
     ground_truth_boxes,
     rollout_boxes,
@@ -40,10 +40,11 @@ from src.responsibility.metrics import (
 from src.responsibility.motion_set import (
     NEIGHBOR_FUTURE_LOGGED,
     MotionSetSynthesizer,
+    RolloutJob,
     find_neighbors,
     shifted_context,
 )
-from src.responsibility.reward_model import extract_trajectory_features, trajectory_log_prob
+from src.responsibility.reward_model import extract_trajectory_features, mean_token_log_prob
 
 
 @dataclass
@@ -187,37 +188,38 @@ def _responsibility_at_current_step(
         candidates = candidates[:max_agents]
     all_idx = list(range(n_agent))
 
-    observations = []
-    for a in candidates:
-        neighbor_mask = find_neighbors(
+    neighbors_of = {
+        a: find_neighbors(
             data["agent"]["position"][..., :2],
             data["agent"]["valid_mask"],
             a,
             at_step=at_step,
             radius=cfg.neighbor_radius,
+        ).nonzero(as_tuple=True)[0].tolist()
+        for a in candidates
+    }
+    # one packed pass for every agent of this window (see ResponsibilityPlan)
+    results, _ = responsibility_for_agents(
+        synthesizer,
+        data,
+        tokenized_map,
+        tokenized_agent,
+        candidates,
+        neighbors_of,
+        all_idx,
+        cfg,
+        map_points=map_points,
+    )
+    return [
+        ResponsibilityObservation(
+            scenario_id=str(scenario_id),
+            agent_id=int(data["agent"]["id"][a]),
+            agent_idx=a,
+            k=k,
+            beta=results[a]["beta"].detach().cpu(),
         )
-        neighbor_indices = neighbor_mask.nonzero(as_tuple=True)[0].tolist()
-        result = compute_agent_responsibility(
-            synthesizer,
-            data,
-            tokenized_map,
-            tokenized_agent,
-            a,
-            neighbor_indices,
-            all_idx,
-            cfg,
-            map_points=map_points,
-        )
-        observations.append(
-            ResponsibilityObservation(
-                scenario_id=str(scenario_id),
-                agent_id=int(data["agent"]["id"][a]),
-                agent_idx=a,
-                k=k,
-                beta=result["beta"].detach().cpu(),
-            )
-        )
-    return observations
+        for a in candidates
+    ]
 
 
 def group_sequences(
@@ -305,41 +307,27 @@ def _features_for_observation(
     map_points = get_map_points(data)
     horizon_arg = synthesizer.round_horizon(cfg.metric_horizon)
 
-    rollouts = synthesizer.sample_rollouts(
-        tokenized_map,
-        tokenized_agent,
-        free_agent_indices=[obs.agent_idx],
-        n_samples=n_aux,
-        sampling_scheme=sampling_scheme,
-        rollout_horizon=horizon_arg,
-        neighbor_future=cfg.neighbor_future,
-    )
-    aux_log_prob = trajectory_log_prob(
-        rollouts["next_token_logits"][:, 0],
-        rollouts["next_token_idx"][:, 0],
-        rollouts["next_token_valid"][:, 0],
-    )  # [n_aux]
+    aux_job = RolloutJob(free=(obs.agent_idx,), n_samples=n_aux)
     # The logged trajectory's own model log-probability, from a pass in
     # which *every* agent replays ground truth (i.e. teacher forcing).
     # Leaving this at 0 for real trajectories and negative for sampled
     # ones would hand the discriminator a trivial shortcut feature.
-    gt_scored = synthesizer.sample_rollouts(
-        tokenized_map,
-        tokenized_agent,
-        free_agent_indices=[],
-        n_samples=1,
-        output_agent_indices=[obs.agent_idx],
-        sampling_scheme=sampling_scheme,
-        rollout_horizon=horizon_arg,
-        # must stay teacher-forced: this pass exists to score the *logged*
-        # trajectory, which only replays under "logged"
-        neighbor_future=NEIGHBOR_FUTURE_LOGGED,
-    )
-    gt_log_prob = trajectory_log_prob(
-        gt_scored["next_token_logits"][:, 0],
-        gt_scored["next_token_idx"][:, 0],
-        gt_scored["next_token_valid"][:, 0],
-    )  # [1]
+    gt_job = RolloutJob(free=(), n_samples=1, outputs=(obs.agent_idx,))
+    common = dict(sampling_scheme=sampling_scheme, rollout_horizon=horizon_arg)
+    if cfg.neighbor_future == NEIGHBOR_FUTURE_LOGGED:
+        rollouts, gt_scored = synthesizer.run_jobs(
+            tokenized_map, tokenized_agent, [aux_job, gt_job], neighbor_future=NEIGHBOR_FUTURE_LOGGED, **common
+        )
+    else:
+        (rollouts,) = synthesizer.run_jobs(
+            tokenized_map, tokenized_agent, [aux_job], neighbor_future=cfg.neighbor_future, **common
+        )
+        # scoring the log must stay teacher-forced whatever the sampling mode
+        (gt_scored,) = synthesizer.run_jobs(
+            tokenized_map, tokenized_agent, [gt_job], neighbor_future=NEIGHBOR_FUTURE_LOGGED, **common
+        )
+    aux_log_prob = mean_token_log_prob(rollouts["token_log_prob"][:, 0], rollouts["next_token_valid"][:, 0])
+    gt_log_prob = mean_token_log_prob(gt_scored["token_log_prob"][:, 0], gt_scored["next_token_valid"][:, 0])
 
     horizon = effective_horizon(data, cfg, rollouts["pred_traj_10hz"].shape[2])
     gt_ego = ground_truth_boxes(data, [obs.agent_idx], cfg.num_historical_steps, horizon)

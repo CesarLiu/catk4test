@@ -82,8 +82,18 @@ def trajectory_log_prob(
     """
     log_probs = torch.log_softmax(next_token_logits, dim=-1)
     gathered = torch.gather(log_probs, -1, next_token_idx.unsqueeze(-1)).squeeze(-1)
-    valid = next_token_valid.to(gathered.dtype)
-    return (gathered * valid).sum(dim=-1) / valid.sum(dim=-1).clamp(min=1.0)
+    return mean_token_log_prob(gathered, next_token_valid)
+
+
+def mean_token_log_prob(
+    token_log_prob: Tensor,  # [..., n_steps] log-prob of each realized token
+    valid: Tensor,  # [..., n_steps]
+) -> Tensor:  # [...]
+    """Mean per-step log-probability over valid steps; the same quantity as
+    :func:`trajectory_log_prob`, from ``run_jobs``' ``token_log_prob``
+    output instead of full logits."""
+    v = valid.to(token_log_prob.dtype)
+    return (token_log_prob * v).sum(dim=-1) / v.sum(dim=-1).clamp(min=1.0)
 
 
 def extract_trajectory_features(

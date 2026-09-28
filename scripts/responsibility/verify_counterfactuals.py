@@ -55,6 +55,7 @@ def parse_args():
     p.add_argument("--scenario-index", type=int, default=0)
     p.add_argument("--horizon", type=int, default=40, help="Rollout steps @10Hz (multiple of 5).")
     p.add_argument("--perturbation", type=float, default=3.0, help="Lateral shift (m) of the neighbour's future.")
+    p.add_argument("--plan-batch-size", type=int, default=32, help="Scene copies per call for the plan check.")
     p.add_argument("--device", default="auto", help="cuda, cpu, or auto (cuda if available).")
     return p.parse_args()
 
@@ -231,6 +232,78 @@ def check_hidden(synth, data, report, a, j, horizon, num_hist, offset):
     )
 
 
+def check_plan(synth, data, report, num_hist, n_queried=4):
+    """The packed, shared window plan must give the same betas as drawing
+    every agent's and every pair's rollouts separately (argmax decoding
+    makes both deterministic, so they are directly comparable)."""
+    import time
+
+    from src.responsibility.dataset_builder import get_map_points
+    from src.responsibility.metrics import (
+        ResponsibilityConfig,
+        courtesy_responsibility,
+        responsibility_for_agents,
+        safety_responsibility,
+    )
+    from src.responsibility.motion_set import find_neighbors
+
+    # Saturation and the courtesy distance skip are off so that the betas
+    # being compared are not trivially zero; argmax decoding makes every
+    # sample of a job identical, so without that most betas would vanish
+    # and the comparison would prove nothing.
+    cfg = ResponsibilityConfig(num_historical_steps=num_hist, n_safety_samples=4, n_courtesy_samples=4,
+                               d_sat=None, courtesy_skip_distance=None)
+    at = num_hist - 1
+    pos = data["agent"]["position"][:, at, :2]
+    n_agent = pos.shape[0]
+    valid_now = data["agent"]["valid_mask"][:, at]
+    neighbors_all = {
+        a: find_neighbors(data["agent"]["position"][..., :2], data["agent"]["valid_mask"], a,
+                          at_step=at, radius=cfg.neighbor_radius).nonzero(as_tuple=True)[0].tolist()
+        for a in range(n_agent)
+        if bool(valid_now[a]) and int(data["agent"]["type"][a]) == 0
+    }
+    # the vehicles with the closest neighbours, each with its 3 nearest
+    def nearest(a):
+        return sorted(neighbors_all[a], key=lambda b: float(torch.linalg.norm(pos[b] - pos[a])))[:3]
+
+    queried = sorted(
+        (a for a in neighbors_all if neighbors_all[a]),
+        key=lambda a: float(torch.linalg.norm(pos[nearest(a)[0]] - pos[a])),
+    )[:n_queried]
+    neighbors_of = {a: nearest(a) for a in queried}
+    all_idx, map_points = list(range(n_agent)), get_map_points(data)
+    tok_map, tok_agent = synth.tokenize(data)
+
+    t0 = time.perf_counter()
+    packed, plan = responsibility_for_agents(synth, data, tok_map, tok_agent, queried, neighbors_of,
+                                             all_idx, cfg, map_points=map_points)
+    t_packed = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    separate = {}
+    for a in queried:
+        s = safety_responsibility(synth, data, tok_map, tok_agent, a, neighbors_of[a], cfg)
+        c = courtesy_responsibility(synth, data, tok_map, tok_agent, a, neighbors_of[a], all_idx, cfg,
+                                    map_points=map_points)
+        separate[a] = torch.stack([s["value"], c["value"]])
+    t_separate = time.perf_counter() - t0
+
+    diff = max(float((packed[a]["beta"] - separate[a]).abs().max()) for a in queried)
+    nonzero_safety = sum(int(separate[a][0] != 0) for a in queried)
+    nonzero_courtesy = sum(int(separate[a][1] != 0) for a in queried)
+    report.add(
+        "packed window plan equals per-pair computation",
+        diff < POSITION_TOL and nonzero_safety > 0,
+        f"max |beta| difference {diff:.2e} over {len(queried)} agents "
+        f"(non-zero safety: {nonzero_safety}, non-zero courtesy: {nonzero_courtesy}; "
+        f"at least one non-zero beta is required for the comparison to mean anything)",
+    )
+    print(f"    info: {plan.n_rollouts} rollouts in {len(plan.jobs)} jobs; "
+          f"packed {t_packed:.1f} s vs separate {t_separate:.1f} s "
+          f"at rollout_batch_size={synth.rollout_batch_size}")
+
+
 def main():
     args = parse_args()
     torch.manual_seed(0)
@@ -262,6 +335,9 @@ def main():
                        data, report, a, horizon, n=3)
         print("hidden")
         check_hidden(synth, data, report, a, j, horizon, num_hist, args.perturbation)
+        print("plan")
+        check_plan(MotionSetSynthesizer(model, argmax, rollout_batch_size=args.plan_batch_size),
+                   data, report, num_hist)
 
     print("\nALL CHECKS PASSED" if report.ok else "\nSOME CHECKS FAILED")
     sys.exit(0 if report.ok else 1)

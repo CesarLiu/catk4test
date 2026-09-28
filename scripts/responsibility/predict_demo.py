@@ -67,7 +67,7 @@ def parse_args():
     p.add_argument("--n-candidates", type=int, default=25)
     p.add_argument("--motion-set-num-k", type=int, default=2048)
     p.add_argument("--motion-set-temp", type=float, default=1.0)
-    p.add_argument("--rollout-batch-size", type=int, default=8)
+    p.add_argument("--rollout-batch-size", type=int, default=0, help="0 = auto")
     p.add_argument("--neighbor-future", default="logged",
                    choices=["logged", "hidden", "simulated"],
                    help="How much of the neighbours' future the queried agent may "
