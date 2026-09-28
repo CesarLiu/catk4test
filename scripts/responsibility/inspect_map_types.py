@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from src.responsibility.pipeline import build_dataloader  # noqa: E402
+from src.responsibility.pipeline import iter_scenarios  # noqa: E402
 
 
 def parse_args():
@@ -27,9 +27,8 @@ def parse_args():
 
 def main():
     args = parse_args()
-    dataloader = build_dataloader(args.data_root)
     counts = Counter()
-    for i, data in enumerate(dataloader):
+    for i, _, data in iter_scenarios(args.data_root):
         if i >= args.n:
             break
         if "pt_token" not in data or "pl_type" not in data["pt_token"]:

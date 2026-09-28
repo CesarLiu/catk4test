@@ -279,8 +279,8 @@ def build_reward_training_features(
                 synthesizer, data, obs, cfg, n_aux, sampling_scheme
             )
         real_list, fake_list = buckets.setdefault(obs.level, ([], []))
-        real_list.append(real_feat)
-        fake_list.append(fake_feat)
+        real_list.append(real_feat.detach().cpu())
+        fake_list.append(fake_feat.detach().cpu())
 
     return {
         level: LevelFeatureSet(real=torch.stack(real_list), fake=torch.cat(fake_list, dim=0))

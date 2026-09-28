@@ -21,11 +21,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from src.responsibility.metrics import ResponsibilityConfig  # noqa: E402
 from src.responsibility.pipeline import (  # noqa: E402
-    build_dataloader,
     compose_responsibility_config,
     default_sampling_scheme,
+    iter_scenarios,
     load_observations,
     load_smart_model,
+    resolve_device,
     save_reward_nets,
     train_reward_stage,
 )
@@ -55,7 +56,7 @@ def parse_args():
                         "condition on: logged (they replay their log and stay visible), "
                         "hidden (visible only up to the current step; the paper's "
                         "open-loop reading), simulated (nobody is teacher-forced).")
-    p.add_argument("--device", default="cpu")
+    p.add_argument("--device", default="auto", help="cuda, cpu, or auto (cuda if available).")
     return p.parse_args()
 
 
@@ -66,12 +67,11 @@ def main():
     print(f"{len(observations)} observations across {len(needed_scenarios)} scenarios need features.")
 
     hydra_cfg = compose_responsibility_config(overrides=[f"model={args.model_config}"])
-    model = load_smart_model(hydra_cfg.model.model_config, args.ckpt, device=args.device)
+    device = resolve_device(args.device)
+    model = load_smart_model(hydra_cfg.model.model_config, args.ckpt, device=device)
 
-    dataloader = build_dataloader(args.data_root)
     data_by_scenario = {}
-    for data in dataloader:
-        scenario_id = str(data["scenario_id"][0]) if "scenario_id" in data else None
+    for _, scenario_id, data in iter_scenarios(args.data_root, device):
         if scenario_id in needed_scenarios:
             data_by_scenario[scenario_id] = data
         if len(data_by_scenario) == len(needed_scenarios):

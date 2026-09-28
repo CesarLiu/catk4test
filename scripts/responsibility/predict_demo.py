@@ -34,12 +34,14 @@ from src.responsibility.dataset_builder import (  # noqa: E402
 from src.responsibility.metrics import ResponsibilityConfig, ground_truth_boxes  # noqa: E402
 from src.responsibility.motion_set import MotionSetSynthesizer, shifted_context  # noqa: E402
 from src.responsibility.pipeline import (  # noqa: E402
-    build_dataloader,
     compose_responsibility_config,
     default_sampling_scheme,
     load_hmm,
     load_reward_nets,
+    load_scenario,
     load_smart_model,
+    resolve_device,
+    scenario_id_of,
 )
 from src.responsibility.selection import predict_responsibility_aware  # noqa: E402
 
@@ -72,25 +74,18 @@ def parse_args():
                         "condition on: logged (they replay their log and stay visible), "
                         "hidden (visible only up to the current step; the paper's "
                         "open-loop reading), simulated (nobody is teacher-forced).")
-    p.add_argument("--device", default="cpu")
+    p.add_argument("--device", default="auto", help="cuda, cpu, or auto (cuda if available).")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
     hydra_cfg = compose_responsibility_config(overrides=[f"model={args.model_config}"])
-    model = load_smart_model(hydra_cfg.model.model_config, args.ckpt, device=args.device)
+    device = resolve_device(args.device)
+    model = load_smart_model(hydra_cfg.model.model_config, args.ckpt, device=device)
     hmm = load_hmm(args.hmm)
     reward_nets = load_reward_nets(args.reward_nets)
-
-    dataloader = build_dataloader(args.data_root)
-    data = None
-    for i, d in enumerate(dataloader):
-        if i == args.scenario_index:
-            data = d
-            break
-    if data is None:
-        raise ValueError(f"data-root has fewer than {args.scenario_index + 1} scenarios.")
+    data = load_scenario(args.data_root, args.scenario_index, device)
 
     num_historical_steps = hydra_cfg.model.model_config.decoder.num_historical_steps
     rcfg = ResponsibilityConfig(
@@ -110,7 +105,7 @@ def main():
     else:
         veh_mask = (data["agent"]["type"] == 0) & data["agent"]["valid_mask"][:, args.predict_step]
         query_idx = int(veh_mask.nonzero(as_tuple=True)[0][0])
-    print(f"Scenario {data.get('scenario_id', args.scenario_index)}, agent index {query_idx}")
+    print(f"Scenario {scenario_id_of(data)}, agent index {query_idx}")
 
     # --- responsibility history: only windows already closed at the prediction step
     steps = causal_window_steps(data, rcfg, synthesizer, args.predict_step, args.window_stride)
@@ -150,7 +145,7 @@ def main():
         err = torch.linalg.norm(traj[:horizon] - gt_traj, dim=-1)
         if not gt_valid.any():
             return float("nan"), float("nan")
-        last_valid = int((torch.arange(horizon) * gt_valid).argmax())
+        last_valid = int((torch.arange(horizon, device=gt_valid.device) * gt_valid).argmax())
         return err[gt_valid].mean().item(), err[last_valid].item()
 
     selected_ade, selected_fde = _displacement_errors(prediction["selected_traj"])

@@ -4,7 +4,7 @@ used by the CLI scripts in ``scripts/responsibility/``.
 
 import pickle
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import hydra
 import torch
@@ -106,17 +106,61 @@ def default_sampling_scheme(num_k: int = 2048, temp: float = 1.0) -> DictConfig:
     return OmegaConf.create({"criterium": "topk_prob", "num_k": num_k, "temp": temp})
 
 
-def build_dataloader(raw_dir: str, tfrecord_dir: Optional[str] = None) -> DataLoader:
+def resolve_device(device: str = "auto") -> str:
+    if device == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    return device
+
+
+def build_dataloader(
+    raw_dir: str,
+    tfrecord_dir: Optional[str] = None,
+    indices: Optional[Sequence[int]] = None,
+) -> DataLoader:
     """batch_size=1 loader so every batch is exactly one scenario with PyG's
     usual ``.batch``/``.num_graphs`` collation fields attached (required by
-    ``TokenProcessor``), matching how ``local_val.sh`` drives the model."""
+    ``TokenProcessor``), matching how ``local_val.sh`` drives the model.
+    ``indices`` restricts it to a subset of the (sorted) scenario files."""
     dataset = MultiDataset(raw_dir, WaymoTargetBuilderVal(), tfrecord_dir=tfrecord_dir)
+    if indices is not None:
+        dataset = dataset[list(indices)]
     return DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
+
+
+def scenario_id_of(data, fallback: str = "unknown") -> str:
+    if "scenario_id" not in data:
+        return fallback
+    raw = data["scenario_id"]
+    return str(raw[0]) if isinstance(raw, (list, tuple)) else str(raw)
+
+
+def count_scenarios(raw_dir: str) -> int:
+    return len(MultiDataset(raw_dir, WaymoTargetBuilderVal()))
+
+
+def iter_scenarios(
+    raw_dir: str,
+    device: str = "cpu",
+    indices: Optional[Sequence[int]] = None,
+) -> Iterator[Tuple[int, str, object]]:
+    """Yields ``(dataset_index, scenario_id, data)`` with ``data`` already on
+    ``device``. The model's buffers live on the device it was loaded to, so
+    scenarios must be moved there before tokenization."""
+    order = list(indices) if indices is not None else range(count_scenarios(raw_dir))
+    loader = build_dataloader(raw_dir, indices=list(order) if indices is not None else None)
+    for dataset_index, data in zip(order, loader):
+        yield dataset_index, scenario_id_of(data, str(dataset_index)), data.to(device)
+
+
+def load_scenario(raw_dir: str, index: int, device: str = "cpu"):
+    for _, _, data in iter_scenarios(raw_dir, device, indices=[index]):
+        return data
+    raise IndexError(f"no scenario {index} in {raw_dir}")
 
 
 def compute_dataset_responsibility(
     model: SMART,
-    dataloader: DataLoader,
+    scenarios: Iterable[Tuple[int, str, object]],
     cfg: ResponsibilityConfig,
     sampling_scheme: Optional[DictConfig] = None,
     agent_type_filter: Optional[int] = 0,
@@ -127,7 +171,7 @@ def compute_dataset_responsibility(
     sweep_windows: bool = True,
 ) -> Tuple[List[ResponsibilityObservation], Dict[str, object]]:
     """Runs Sec. III's counterfactual responsibility pipeline over every
-    scenario in ``dataloader``. Returns the flat observation list and (if
+    scenario yielded by ``scenarios`` (see :func:`iter_scenarios`). Returns the flat observation list and (if
     ``keep_data``) a ``scenario_id -> data`` dict for reuse when building
     the reward-network training features later.
 
@@ -141,10 +185,9 @@ def compute_dataset_responsibility(
     observations: List[ResponsibilityObservation] = []
     data_by_scenario: Dict[str, object] = {}
 
-    for i, data in enumerate(dataloader):
+    for i, (_, scenario_id, data) in enumerate(scenarios):
         if max_scenarios is not None and i >= max_scenarios:
             break
-        scenario_id = str(data["scenario_id"][0]) if "scenario_id" in data else str(i)
         steps = (
             window_steps(data, cfg, synthesizer, cfg.window_stride)
             if sweep_windows

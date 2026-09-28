@@ -29,7 +29,7 @@ from src.responsibility.reward_model import (
 def current_responsibility_level(beta_history: Tensor, hmm: GaussianHMM) -> int:
     """z_k, Eq. (6): the most likely responsibility level given the
     observation history up to and including the current step."""
-    posterior = hmm.forward_filter(beta_history.numpy())
+    posterior = hmm.forward_filter(beta_history.detach().cpu().numpy())
     return int(posterior[-1].argmax())
 
 

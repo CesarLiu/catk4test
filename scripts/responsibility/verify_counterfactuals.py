@@ -35,10 +35,12 @@ from src.responsibility.motion_set import (  # noqa: E402
     MotionSetSynthesizer,
 )
 from src.responsibility.pipeline import (  # noqa: E402
-    build_dataloader,
     compose_responsibility_config,
     default_sampling_scheme,
+    load_scenario,
     load_smart_model,
+    resolve_device,
+    scenario_id_of,
 )
 
 LOGIT_TOL = 1e-3
@@ -53,7 +55,7 @@ def parse_args():
     p.add_argument("--scenario-index", type=int, default=0)
     p.add_argument("--horizon", type=int, default=40, help="Rollout steps @10Hz (multiple of 5).")
     p.add_argument("--perturbation", type=float, default=3.0, help="Lateral shift (m) of the neighbour's future.")
-    p.add_argument("--device", default="cpu")
+    p.add_argument("--device", default="auto", help="cuda, cpu, or auto (cuda if available).")
     return p.parse_args()
 
 
@@ -75,7 +77,7 @@ def _agent_deleted(data, j: int):
     """Removes agent ``j`` from every per-agent tensor of the scenario."""
     store = data["agent"]
     n_agent = store["position"].shape[0]
-    keep = torch.arange(n_agent) != j
+    keep = torch.arange(n_agent, device=store["position"].device) != j
     originals = {}
     for key in list(store.keys()):
         value = store[key]
@@ -233,7 +235,8 @@ def main():
     args = parse_args()
     torch.manual_seed(0)
     hydra_cfg = compose_responsibility_config(overrides=[f"model={args.model_config}"])
-    model = load_smart_model(hydra_cfg.model.model_config, args.ckpt, device=args.device)
+    device = resolve_device(args.device)
+    model = load_smart_model(hydra_cfg.model.model_config, args.ckpt, device=device)
     num_hist = hydra_cfg.model.model_config.decoder.num_historical_steps
 
     argmax = default_sampling_scheme(num_k=1, temp=1.0)
@@ -241,17 +244,11 @@ def main():
     shift = synth.token_shift
     horizon = synth.round_horizon(args.horizon)
 
-    data = None
-    for i, d in enumerate(build_dataloader(args.data_root)):
-        if i == args.scenario_index:
-            data = d
-            break
-    if data is None:
-        raise ValueError(f"fewer than {args.scenario_index + 1} scenarios in {args.data_root}")
+    data = load_scenario(args.data_root, args.scenario_index, device)
 
     a, j, dist = _pick_interacting_pair(data, num_hist - 1, horizon)
     n_agent = data["agent"]["position"].shape[0]
-    print(f"scenario {data['scenario_id'][0]}: {n_agent} agents; "
+    print(f"scenario {scenario_id_of(data)}: {n_agent} agents; "
           f"queried agent {a}, neighbour {j} ({dist:.1f} m apart); horizon {horizon} steps")
 
     report = Report()

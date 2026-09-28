@@ -50,8 +50,10 @@ class RewardNetBundle:
     feature_std: Tensor
 
     def reward(self, raw_features: Tensor) -> Tensor:
-        normed = (raw_features - self.feature_mean) / self.feature_std
-        return self.model.reward(normed)
+        # the nets are tiny and live on CPU; features may come from a GPU rollout
+        device = raw_features.device
+        normed = (raw_features.to(self.feature_mean.device) - self.feature_mean) / self.feature_std
+        return self.model.reward(normed).to(device)
 
     def state_dict(self) -> Dict:
         return {
@@ -121,6 +123,7 @@ def train_reward_network(
     L(phi) = -sum y*log(R(xi)) + (1-y)*log(1-R(xi)), y=1 for real trajectories.
     """
     torch.manual_seed(seed)
+    features_real, features_fake = features_real.detach().cpu(), features_fake.detach().cpu()
     all_features = torch.cat([features_real, features_fake], dim=0)
     feature_mean = all_features.mean(dim=0)
     feature_std = all_features.std(dim=0).clamp(min=1e-6)

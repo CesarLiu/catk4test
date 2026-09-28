@@ -152,7 +152,7 @@ def safety_responsibility(
     """beta^safety_k(a, x_k), Eq. (5): worst-case (max) safety responsibility
     of ``query_idx`` over all its neighbors."""
     if len(neighbor_indices) == 0:
-        return {"per_neighbor": {}, "value": torch.tensor(0.0)}
+        return {"per_neighbor": {}, "value": torch.zeros((), device=data["agent"]["position"].device)}
 
     rollouts = synthesizer.sample_rollouts(
         tokenized_map,
@@ -317,7 +317,7 @@ def courtesy_responsibility(
     """beta^courtesy_k(a, x_k), Eq. (5): worst-case courtesy responsibility
     of ``query_idx`` over all its neighbors."""
     if len(neighbor_indices) == 0:
-        return {"per_neighbor": {}, "value": torch.tensor(0.0)}
+        return {"per_neighbor": {}, "value": torch.zeros((), device=data["agent"]["position"].device)}
 
     per_neighbor = {}
     for b in neighbor_indices:
