@@ -64,15 +64,37 @@ def compose_responsibility_config(overrides: Optional[List[str]] = None) -> Dict
 
 def load_smart_model(model_config: DictConfig, ckpt_path: str, device: str = "cpu") -> SMART:
     """Loads a SMART checkpoint for inference-only use (no Trainer needed),
-    mirroring the weight-loading call in ``src/run.py``'s ``finetune`` action."""
+    mirroring the weight-loading call in ``src/run.py``'s ``finetune`` action.
+
+    Fails loudly rather than returning a partly random model: every
+    parameter must come from the checkpoint, and the decoder hyper-
+    parameters it was trained with must match ``model_config`` (radii and
+    step counts do not show up as shape mismatches but change behaviour).
+    """
+    # Lightning checkpoints carry DictConfig hyper-parameters, which the
+    # weights_only default of torch>=2.6 refuses to unpickle.
+    state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+
+    trained = state.get("hyper_parameters", {}).get("model_config", None)
+    if trained is not None and "decoder" in trained:
+        want = OmegaConf.to_container(model_config.decoder, resolve=True)
+        got = OmegaConf.to_container(trained["decoder"], resolve=True)
+        mismatched = {k: (got.get(k), want.get(k)) for k in want if got.get(k) != want.get(k)}
+        if mismatched:
+            raise ValueError(
+                f"{ckpt_path} was trained with a different decoder config "
+                f"(checkpoint, requested): {mismatched}. Pick the matching configs/model/*.yaml."
+            )
+
     model = SMART(model_config)
-    state = torch.load(ckpt_path, map_location="cpu")
     state_dict = state["state_dict"] if "state_dict" in state else state
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    if len(missing) > 0:
-        print(f"[load_smart_model] missing keys: {missing}")
-    if len(unexpected) > 0:
-        print(f"[load_smart_model] unexpected keys: {unexpected}")
+    param_names = {name for name, _ in model.named_parameters()}
+    missing_params = [k for k in missing if k in param_names]
+    if missing_params:
+        raise ValueError(f"{ckpt_path} does not provide these parameters: {missing_params}")
+    if unexpected:
+        print(f"[load_smart_model] ignoring unexpected keys: {unexpected}")
     model.eval()
     return model.to(device)
 

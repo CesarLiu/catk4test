@@ -213,6 +213,48 @@ config via a small dedicated Hydra tree, `configs/responsibility/eval.yaml`
 (see `src/responsibility/pipeline.compose_responsibility_config`), rather
 than the full `src/run.py` training entry point.
 
+## Environment notes
+
+- **Pin `torch_geometric==2.6.1`.** The README's unpinned
+  `pip install torch_geometric` now resolves to 2.8, whose `BaseTransform`
+  makes `forward` abstract; this repo's `WaymoTargetBuilder*` transforms
+  override `__call__` instead, so the datamodule fails with *Can't
+  instantiate abstract class WaymoTargetBuilderVal*. 2.6.1 works with the
+  pinned torch 2.4.
+- **`waymo-open-dataset` ships Linux wheels only.** On Windows, use WSL2
+  (Ubuntu 22.04's Python 3.10 fits TF 2.12). Everything here runs on CPU,
+  just slowly.
+- **The WOMD testing split has no future ground truth**, so responsibility,
+  which is measured against the logged future, can only be computed on
+  training or validation.
+
+## Verifying against a checkpoint
+
+The unit tests stub SMART's sampler, so they cannot confirm that SMART
+itself behaves as the counterfactual machinery assumes. Run this once per
+checkpoint:
+
+```bash
+python -m scripts.responsibility.verify_counterfactuals     --ckpt ckpts/clsft_E9.ckpt --data-root data/womd_cache/validation
+```
+
+It checks, with argmax decoding so runs are comparable, that forcing
+reproduces the tokenized log, that masking an agent out equals deleting it,
+that batched scene copies equal separate calls, and that a perturbation of a
+neighbour's logged future reaches the queried agent under `logged` but not
+under `hidden`. On `clsft_E9` (scenario `101d7af08d9b56ae`, 36 agents):
+
+| check | result |
+|---|---|
+| forcing vs tokenized log | 0.00 m (vs raw log: mean 0.034 m, p95 0.091 m, max 0.254 m -- the token quantization floor) |
+| masked vs deleted | 6.7e-6 logit difference (1.61 with the agent kept) |
+| 3 batched vs 3 separate | 8.6e-6, identical tokens |
+| neighbour future perturbed by 3 m | `logged` moves the queried agent's logits by 0.454, `hidden` by 5.7e-6 |
+
+The residual ~1e-5 differences are float32 accumulation-order noise
+(`torch_scatter` sums in a thread-dependent order on CPU), five orders of
+magnitude below the effects being tested.
+
 ## Testing
 
 `tests/responsibility/` runs without a checkpoint, `torch_geometric`,

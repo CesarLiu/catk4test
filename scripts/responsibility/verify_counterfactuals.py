@@ -1,0 +1,274 @@
+"""Checks, against a real checkpoint and real scenarios, the assumptions the
+counterfactual machinery makes about SMART's decoder -- the ones the
+stubbed unit tests in tests/responsibility cannot see.
+
+  forcing   teacher-forcing agents onto their logged tokens reproduces the
+            tokenized log exactly (and the raw log up to token quantization)
+  removal   zeroing an agent's validity mask predicts the same for everyone
+            else as deleting that agent from the scenario outright
+  batching  N replicated scene copies in one call equal N separate calls
+  hidden    with neighbor_future=hidden, perturbing a neighbour's logged
+            future leaves the queried agent's predictions unchanged, while
+            with neighbor_future=logged it does not -- i.e. the leak the
+            switch exists for is real, and "hidden" closes it
+
+All rollouts use argmax decoding (num_k=1) so that runs are comparable.
+Exits non-zero if any check fails.
+
+Example:
+    python -m scripts.responsibility.verify_counterfactuals \
+        --ckpt ckpts/clsft_E9.ckpt --data-root data/womd_cache/validation
+"""
+
+import argparse
+import contextlib
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+import torch  # noqa: E402
+
+from src.responsibility.motion_set import (  # noqa: E402
+    NEIGHBOR_FUTURE_HIDDEN,
+    NEIGHBOR_FUTURE_LOGGED,
+    MotionSetSynthesizer,
+)
+from src.responsibility.pipeline import (  # noqa: E402
+    build_dataloader,
+    compose_responsibility_config,
+    default_sampling_scheme,
+    load_smart_model,
+)
+
+LOGIT_TOL = 1e-3
+POSITION_TOL = 1e-3  # metres
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--ckpt", required=True)
+    p.add_argument("--data-root", required=True, help="Cached scenario .pkl directory.")
+    p.add_argument("--model-config", default="smart")
+    p.add_argument("--scenario-index", type=int, default=0)
+    p.add_argument("--horizon", type=int, default=40, help="Rollout steps @10Hz (multiple of 5).")
+    p.add_argument("--perturbation", type=float, default=3.0, help="Lateral shift (m) of the neighbour's future.")
+    p.add_argument("--device", default="cpu")
+    return p.parse_args()
+
+
+@contextlib.contextmanager
+def _agent_fields_replaced(data, **replacements):
+    store = data["agent"]
+    originals = {k: store[k] for k in replacements}
+    try:
+        for k, v in replacements.items():
+            store[k] = v
+        yield data
+    finally:
+        for k, v in originals.items():
+            store[k] = v
+
+
+@contextlib.contextmanager
+def _agent_deleted(data, j: int):
+    """Removes agent ``j`` from every per-agent tensor of the scenario."""
+    store = data["agent"]
+    n_agent = store["position"].shape[0]
+    keep = torch.arange(n_agent) != j
+    originals = {}
+    for key in list(store.keys()):
+        value = store[key]
+        if torch.is_tensor(value) and value.dim() > 0 and value.shape[0] == n_agent:
+            originals[key] = value
+    try:
+        for key, value in originals.items():
+            store[key] = value[keep]
+        yield data
+    finally:
+        for key, value in originals.items():
+            store[key] = value
+
+
+def _pick_interacting_pair(data, at_step: int, horizon: int):
+    """Closest vehicle pair that is logged for the whole horizon."""
+    pos = data["agent"]["position"][..., :2]
+    valid = data["agent"]["valid_mask"][:, at_step : at_step + horizon + 1].all(-1)
+    vehicle = data["agent"]["type"] == 0
+    best = None
+    for a in torch.nonzero(vehicle & valid).flatten().tolist():
+        dist = torch.linalg.norm(pos[:, at_step] - pos[a, at_step], dim=-1)
+        dist[a] = float("inf")
+        dist[~valid] = float("inf")
+        j = int(dist.argmin())
+        if torch.isfinite(dist[j]) and (best is None or dist[j] < best[2]):
+            best = (a, j, float(dist[j]))
+    if best is None:
+        raise RuntimeError("no pair of agents logged over the whole horizon in this scenario")
+    return best
+
+
+class Report:
+    def __init__(self):
+        self.rows = []
+
+    def add(self, name, ok, detail):
+        self.rows.append((name, ok, detail))
+        print(f"  [{'PASS' if ok else 'FAIL'}] {name}: {detail}", flush=True)
+
+    @property
+    def ok(self):
+        return all(ok for _, ok, _ in self.rows)
+
+
+def _rollout(synth, data, free, horizon, **kw):
+    tok_map, tok_agent = synth.tokenize(data)
+    return synth.sample_rollouts(
+        tok_map, tok_agent, free_agent_indices=free, n_samples=kw.pop("n_samples", 1),
+        rollout_horizon=horizon, **kw,
+    ), tok_agent
+
+
+def _max_abs(a, b):
+    return float((a - b).abs().max())
+
+
+def check_forcing(synth, data, report, num_hist, horizon, shift):
+    out, tok_agent = _rollout(synth, data, free=[], horizon=horizon,
+                              output_agent_indices=range(data["agent"]["position"].shape[0]))
+    n_steps = horizon // shift
+    token_valid = tok_agent["valid_mask"][:, : 2 + n_steps].all(-1)
+    raw_valid = data["agent"]["valid_mask"][:, num_hist : num_hist + horizon].all(-1)
+    agents = token_valid & raw_valid
+    n = int(agents.sum())
+
+    pred = out["pred_traj_10hz"][0]  # [n_agent, H, 2]
+    endpoints = pred[:, shift - 1 :: shift]  # 2Hz poses the rollout lands on
+    tokenized = tok_agent["gt_pos"][:, 2 : 2 + n_steps]
+    err_tok = torch.linalg.norm(endpoints - tokenized, dim=-1)[agents]
+    report.add(
+        "forcing reproduces the tokenized log",
+        bool(err_tok.max() < POSITION_TOL),
+        f"max error {err_tok.max():.2e} m over {n} fully logged agents",
+    )
+
+    raw = data["agent"]["position"][:, num_hist : num_hist + horizon, :2]
+    err_raw = torch.linalg.norm(pred - raw, dim=-1)[agents]
+    print(
+        f"    info: vs the raw log (token quantization floor): mean {err_raw.mean():.3f} m, "
+        f"p95 {err_raw.flatten().quantile(0.95):.3f} m, max {err_raw.max():.3f} m"
+    )
+
+
+def check_removal(synth, data, report, a, j, horizon):
+    masked, _ = _rollout(synth, data, free=[a], horizon=horizon, remove_agent_indices=[j])
+    present, _ = _rollout(synth, data, free=[a], horizon=horizon)
+    with _agent_deleted(data, j):
+        deleted, _ = _rollout(synth, data, free=[a - int(a > j)], horizon=horizon)
+
+    diff_removed = _max_abs(masked["next_token_logits"], deleted["next_token_logits"])
+    diff_present = _max_abs(masked["next_token_logits"], present["next_token_logits"])
+    report.add(
+        "mask removal equals deletion",
+        diff_removed < LOGIT_TOL and diff_present > LOGIT_TOL,
+        f"|logits(masked) - logits(deleted)| = {diff_removed:.2e}; "
+        f"vs agent present = {diff_present:.2e} (must be clearly > 0 for the check to mean anything)",
+    )
+
+
+def check_batching(synth_1, synth_n, data, report, a, horizon, n):
+    single, _ = _rollout(synth_1, data, free=[a], horizon=horizon, n_samples=n)
+    batched, _ = _rollout(synth_n, data, free=[a], horizon=horizon, n_samples=n)
+    diff = _max_abs(single["next_token_logits"], batched["next_token_logits"])
+    same_tokens = torch.equal(single["next_token_idx"], batched["next_token_idx"])
+    report.add(
+        f"{n} batched copies equal {n} separate calls",
+        diff < LOGIT_TOL and same_tokens,
+        f"max logit diff {diff:.2e}, identical tokens: {same_tokens}",
+    )
+
+
+def check_hidden(synth, data, report, a, j, horizon, num_hist, offset):
+    shifted = data["agent"]["position"].clone()
+    shifted[j, num_hist:, 1] += offset
+
+    def run(mode, perturbed):
+        context = _agent_fields_replaced(data, position=shifted) if perturbed else contextlib.nullcontext()
+        with context:
+            out, _ = _rollout(synth, data, free=[a], horizon=horizon,
+                              neighbor_future=mode, output_agent_indices=[a, j])
+        return out
+
+    base_l, pert_l = run(NEIGHBOR_FUTURE_LOGGED, False), run(NEIGHBOR_FUTURE_LOGGED, True)
+    neighbour_moved = not torch.equal(base_l["next_token_idx"][:, 1], pert_l["next_token_idx"][:, 1])
+    step0 = _max_abs(base_l["next_token_logits"][:, 0, 0], pert_l["next_token_logits"][:, 0, 0])
+    leak = _max_abs(base_l["next_token_logits"][:, 0], pert_l["next_token_logits"][:, 0])
+
+    base_h, pert_h = run(NEIGHBOR_FUTURE_HIDDEN, False), run(NEIGHBOR_FUTURE_HIDDEN, True)
+    closed = _max_abs(base_h["next_token_logits"][:, 0], pert_h["next_token_logits"][:, 0])
+
+    report.add(
+        "perturbing the neighbour's future changes its replayed tokens",
+        neighbour_moved,
+        f"shifted agent {j}'s future by {offset} m laterally",
+    )
+    report.add(
+        "the future cannot reach the first decision",
+        step0 < LOGIT_TOL,
+        f"step-0 logit change {step0:.2e}",
+    )
+    report.add(
+        "logged mode leaks the neighbour's future",
+        leak > LOGIT_TOL,
+        f"queried agent's logits moved by up to {leak:.2e}",
+    )
+    report.add(
+        "hidden mode closes the leak",
+        closed < LOGIT_TOL,
+        f"queried agent's logits moved by up to {closed:.2e}",
+    )
+
+
+def main():
+    args = parse_args()
+    torch.manual_seed(0)
+    hydra_cfg = compose_responsibility_config(overrides=[f"model={args.model_config}"])
+    model = load_smart_model(hydra_cfg.model.model_config, args.ckpt, device=args.device)
+    num_hist = hydra_cfg.model.model_config.decoder.num_historical_steps
+
+    argmax = default_sampling_scheme(num_k=1, temp=1.0)
+    synth = MotionSetSynthesizer(model, argmax, rollout_batch_size=1)
+    shift = synth.token_shift
+    horizon = synth.round_horizon(args.horizon)
+
+    data = None
+    for i, d in enumerate(build_dataloader(args.data_root)):
+        if i == args.scenario_index:
+            data = d
+            break
+    if data is None:
+        raise ValueError(f"fewer than {args.scenario_index + 1} scenarios in {args.data_root}")
+
+    a, j, dist = _pick_interacting_pair(data, num_hist - 1, horizon)
+    n_agent = data["agent"]["position"].shape[0]
+    print(f"scenario {data['scenario_id'][0]}: {n_agent} agents; "
+          f"queried agent {a}, neighbour {j} ({dist:.1f} m apart); horizon {horizon} steps")
+
+    report = Report()
+    with torch.no_grad():
+        print("forcing")
+        check_forcing(synth, data, report, num_hist, horizon, shift)
+        print("removal")
+        check_removal(synth, data, report, a, j, horizon)
+        print("batching")
+        check_batching(synth, MotionSetSynthesizer(model, argmax, rollout_batch_size=3),
+                       data, report, a, horizon, n=3)
+        print("hidden")
+        check_hidden(synth, data, report, a, j, horizon, num_hist, args.perturbation)
+
+    print("\nALL CHECKS PASSED" if report.ok else "\nSOME CHECKS FAILED")
+    sys.exit(0 if report.ok else 1)
+
+
+if __name__ == "__main__":
+    main()

@@ -5,3 +5,5 @@
 # terms do not allow redistributing models trained on it (see README)
 ckpts/
 **/*.ckpt
+# WOMD raw shards and preprocessed caches (Waymo Open Dataset terms)
+data/
