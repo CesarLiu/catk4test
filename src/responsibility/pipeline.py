@@ -2,7 +2,7 @@
 used by the CLI scripts in ``scripts/responsibility/``.
 """
 
-import pickle
+from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
@@ -24,6 +24,17 @@ from src.responsibility.dataset_builder import (
 from src.responsibility.hmm import GaussianHMM, ModelSelectionResult, fit_hmm_with_model_selection
 from src.responsibility.metrics import ResponsibilityConfig
 from src.responsibility.motion_set import MotionSetSynthesizer
+from src.responsibility.results_io import (  # noqa: F401  (re-exported for scripts)
+    atomic_pickle,
+    check_run_config,
+    load_hmm,
+    load_observations,
+    load_reward_nets,
+    save_hmm,
+    save_observations,
+    save_reward_nets,
+    scenario_files,
+)
 from src.responsibility.reward_model import RewardNetBundle, train_reward_networks_per_level
 from src.smart.datamodules.target_builder import WaymoTargetBuilderVal
 from src.smart.datasets.scalable_dataset import MultiDataset
@@ -264,33 +275,78 @@ def train_reward_stage(
     )
 
 
-def save_observations(observations: List[ResponsibilityObservation], path: str) -> None:
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "wb") as f:
-        pickle.dump(observations, f)
+# ---------------------------------------------------------------------------
+# Resumable, shardable stage 1
+# ---------------------------------------------------------------------------
 
 
-def load_observations(path: str) -> List[ResponsibilityObservation]:
-    with open(path, "rb") as f:
-        return pickle.load(f)
+def run_responsibility_to_dir(
+    model: SMART,
+    data_root: str,
+    out_dir: str,
+    cfg: ResponsibilityConfig,
+    run_config: Dict,
+    device: str = "cpu",
+    sampling_scheme: Optional[DictConfig] = None,
+    agent_type_filter: Optional[int] = 0,
+    max_agents_per_scenario: Optional[int] = None,
+    max_scenarios: Optional[int] = None,
+    sweep_windows: bool = True,
+    rollout_batch_size: Optional[int] = None,
+    num_shards: int = 1,
+    shard_index: int = 0,
+    allow_config_mismatch: bool = False,
+    log=None,
+) -> Dict[str, int]:
+    """Stage 1 over a dataset, one result file per scenario under
+    ``out_dir/obs/``. Scenarios that already have a result are skipped, so an
+    interrupted run resumes where it stopped, and ``num_shards`` processes
+    with distinct ``shard_index`` can fill the same directory in parallel."""
+    import time
 
+    if log is None:  # unbuffered: this is usually redirected to a log file
+        def log(message):
+            print(message, flush=True)
 
-def save_hmm(hmm: GaussianHMM, path: str) -> None:
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "wb") as f:
-        pickle.dump(hmm, f)
+    out = Path(out_dir)
+    (out / "obs").mkdir(parents=True, exist_ok=True)
+    # settings added after a directory was started still match at their default
+    defaults = {"responsibility": asdict(ResponsibilityConfig(num_historical_steps=cfg.num_historical_steps))}
+    check_run_config(out, run_config, allow_config_mismatch, defaults=defaults)
 
+    files = scenario_files(data_root)
+    mine = [i for i in range(len(files)) if i % num_shards == shard_index]
+    if max_scenarios is not None:
+        mine = mine[:max_scenarios]
+    todo = [i for i in mine if not (out / "obs" / f"{files[i].stem}.pkl").exists()]
+    log(f"[shard {shard_index}/{num_shards}] {len(mine)} scenarios assigned, "
+        f"{len(mine) - len(todo)} already done, {len(todo)} to go")
 
-def load_hmm(path: str) -> GaussianHMM:
-    with open(path, "rb") as f:
-        return pickle.load(f)
+    synthesizer = MotionSetSynthesizer(
+        model, sampling_scheme or default_sampling_scheme(), rollout_batch_size=rollout_batch_size
+    )
+    totals = {"scenarios": 0, "observations": 0, "rollouts": 0, "windows": 0}
+    start = time.perf_counter()
+    for n_done, (index, scenario_id, data) in enumerate(iter_scenarios(data_root, device, indices=todo), 1):
+        t0 = time.perf_counter()
+        stats: Dict[str, int] = {}
+        steps = window_steps(data, cfg, synthesizer, cfg.window_stride) if sweep_windows else None
+        obs = compute_scenario_responsibility(
+            synthesizer, data, cfg, agent_type_filter=agent_type_filter,
+            max_agents=max_agents_per_scenario, steps=steps, stats=stats,
+        )
+        for o in obs:
+            o.scenario_id = scenario_id
+        atomic_pickle(obs, out / "obs" / f"{files[index].stem}.pkl")
 
-
-def save_reward_nets(bundles: Dict[int, RewardNetBundle], path: str) -> None:
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    torch.save({level: b.state_dict() for level, b in bundles.items()}, path)
-
-
-def load_reward_nets(path: str, hidden_dim: int = 32) -> Dict[int, RewardNetBundle]:
-    states = torch.load(path, map_location="cpu")
-    return {level: RewardNetBundle.load_state_dict(state, hidden_dim=hidden_dim) for level, state in states.items()}
+        dt = time.perf_counter() - t0
+        totals["scenarios"] += 1
+        totals["observations"] += len(obs)
+        totals["rollouts"] += stats.get("rollouts", 0)
+        totals["windows"] += stats.get("windows", 0)
+        elapsed = time.perf_counter() - start
+        eta = elapsed / n_done * (len(todo) - n_done)
+        log(f"[shard {shard_index}] {n_done}/{len(todo)} {scenario_id}: {len(obs)} obs, "
+            f"{stats.get('rollouts', 0)} rollouts in {dt:.1f} s "
+            f"({stats.get('rollouts', 0) / max(dt, 1e-9):.0f}/s); eta {eta / 3600:.1f} h")
+    return totals
