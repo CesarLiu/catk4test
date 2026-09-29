@@ -168,6 +168,7 @@ The choices that matter most (all documented in docs/responsibility.md):
 | `--neighbor-future` | `logged` | what the queried agent may foresee of the others: `logged`, `hidden` (paper's open-loop reading), `simulated` |
 | `--courtesy-estimator` | `boltzmann` | paper's Eq. 7 proxy, or `exact` model KL (usually more informative) |
 | `--plausible-fraction` | `1.0` | take the safety CVaR over only the most probable fraction of samples |
+| `--route-consistent` | off | take the safety CVaR over only the samples that stay within this many metres (e.g. 1.75) of the logged route: speed free, route fixed |
 | `--n-safety-samples`, `--n-courtesy-samples` | 40, 20 | Monte-Carlo sizes |
 | `--window-stride` | 5 | context steps between responsibility windows in a clip |
 

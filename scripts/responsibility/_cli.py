@@ -52,6 +52,9 @@ def add_responsibility_args(p: argparse.ArgumentParser) -> None:
     g.add_argument("--plausible-fraction", type=float, default=d.plausible_fraction,
                    help="Take the safety CVaR over only this most-probable fraction of the "
                         "queried agent's samples (1.0 keeps all, the paper's definition).")
+    g.add_argument("--route-consistent", type=float, default=0.0, metavar="METRES",
+                   help="Take the safety CVaR over only the samples that stay within this distance of "
+                        "the queried agent's logged route (speed free, route fixed); <=0 keeps all.")
     g.add_argument("--collision-weight", type=float, default=d.collision_weight)
     g.add_argument("--drivable-half-width", type=float, default=d.drivable_half_width)
     g.add_argument("--neighbor-future", default=d.neighbor_future, choices=NEIGHBOR_FUTURE_MODES,
@@ -96,6 +99,7 @@ def responsibility_config_from_args(args, num_historical_steps: int) -> Responsi
         courtesy_estimator=args.courtesy_estimator,
         others_future=args.others_future,
         plausible_fraction=args.plausible_fraction,
+        route_tolerance=_none_if_nonpositive(args.route_consistent),
         query_mode=args.query,
         query_direction=args.direction,
         interaction=InteractionConfig(

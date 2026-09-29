@@ -14,6 +14,8 @@ from torch import Tensor
 from src.responsibility.geometry import (
     BoxTrajectories,
     collision_cost,
+    lateral_deviation,
+    logged_route,
     pairwise_min_distance_over_time,
     road_deviation_cost,
 )
@@ -110,6 +112,17 @@ class ResponsibilityConfig:
     # erratic tokens -- and the upper-tail CVaR looks exactly at the samples
     # that stray furthest. 1.0 keeps every sample (the paper's definition).
     plausible_fraction: float = 1.0
+    # Keep only samples of the queried agent that stay within this many
+    # metres of the path it actually took (its logged route, extended along
+    # its final heading), before the safety CVaR. Speed and timing along the
+    # route stay free: braking, yielding and accelerating all remain
+    # alternatives, while turning off onto another route does not. Where an
+    # agent goes is its goal, not a safety choice; without this, a car going
+    # straight through a conflict "could have turned right" and scores a
+    # large safety responsibility for it. The route is read from the logged
+    # future: an assumption about intent, not about how the agent drove.
+    # None keeps every sample (the paper's definition).
+    route_tolerance: Optional[float] = None
 
 
 def future_slice(tensor: Tensor, num_historical_steps: int, horizon: Optional[int] = None) -> Tensor:
@@ -248,6 +261,31 @@ def plausible_sample_indices(
     return score.topk(n_keep).indices.sort().values
 
 
+def route_consistent_sample_indices(
+    sampled_traj: Tensor,  # [N, T, 2]
+    data,
+    query_idx: int,
+    cfg: "ResponsibilityConfig",
+    horizon: int,
+) -> Tensor:  # [<=N] long
+    """Samples that never leave the queried agent's logged route by more
+    than ``cfg.route_tolerance`` (see ResponsibilityConfig). If none does,
+    the one that strays least is kept, so the CVaR stays defined."""
+    agent = data["agent"]
+    now = cfg.num_historical_steps - 1
+    gt = ground_truth_boxes(data, [query_idx], cfg.num_historical_steps, horizon)
+    valid = gt.valid[0]
+    if bool(valid.any()):
+        last = int(torch.nonzero(valid).max())
+        end_heading = gt.heading[0, last]
+    else:
+        end_heading = agent["heading"][query_idx, now]
+    route = logged_route(agent["position"][query_idx, now, :2], gt.pos[0], valid, end_heading)
+    worst = lateral_deviation(sampled_traj, route).amax(dim=-1)  # [N]
+    keep = torch.nonzero(worst <= cfg.route_tolerance).flatten()
+    return keep if keep.numel() > 0 else worst.argmin().reshape(1)
+
+
 def safety_from_rollouts(
     rollouts: Dict[str, Tensor],
     data,
@@ -262,11 +300,15 @@ def safety_from_rollouts(
 
     horizon = effective_horizon(data, cfg, rollouts["pred_traj_10hz"].shape[2])
     sampled_traj_a = rollouts["pred_traj_10hz"][:, 0, :horizon]  # [N, H, 2]
+    keep = torch.arange(sampled_traj_a.shape[0], device=sampled_traj_a.device)
+    # intent first (same route), then plausibility among what is left
+    if cfg.route_tolerance is not None:
+        keep = route_consistent_sample_indices(sampled_traj_a, data, query_idx, cfg, horizon)
     if cfg.plausible_fraction < 1.0:
-        keep = plausible_sample_indices(
-            rollouts["token_log_prob"][:, 0], rollouts["next_token_valid"][:, 0], cfg.plausible_fraction
-        )
-        sampled_traj_a = sampled_traj_a[keep]
+        keep = keep[plausible_sample_indices(
+            rollouts["token_log_prob"][keep, 0], rollouts["next_token_valid"][keep, 0], cfg.plausible_fraction
+        )]
+    sampled_traj_a = sampled_traj_a[keep]
     gt_a = ground_truth_boxes(data, [query_idx], cfg.num_historical_steps, horizon)
     gt_nb = ground_truth_boxes(data, list(neighbor_indices), cfg.num_historical_steps, horizon)
 

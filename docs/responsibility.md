@@ -83,6 +83,24 @@ used by this repo's `WOSACMetrics`.
   `0.9`, the 10% of samples with the lowest mean per-token log-probability
   are dropped before the CVaR; draw proportionally more samples to keep the
   tail size. Courtesy is an expectation and is left unfiltered.
+- **Optionally, only route-consistent alternatives enter the safety CVaR**
+  (`--route-consistent METRES`, default off). Where an agent is heading is
+  its goal, not a safety choice. SMART is not goal-conditioned, so its
+  motion set of a car going straight through a conflict also holds "turn
+  right instead", which moves away from the crossing car. That gains margin
+  and shows up as a large safety responsibility ("it could have turned").
+  With the switch on, a sample is kept only if it stays within that many
+  metres (e.g. 1.75, half a lane) of the agent's **logged route**: its
+  current position, its logged future positions, and a 100 m extension
+  along its final logged heading. Distance is measured to the path, not to
+  the logged position at the same time, so speed and timing stay free.
+  Braking, yielding and accelerating (past the end of the log, onto the
+  extension) all remain alternatives; changing route does not. A stopped
+  agent's route is straight ahead along its heading. If no sample follows
+  the route, the one that strays least is kept. This uses the logged future,
+  but only for *where* the agent went (its intent), never *how* it drove
+  there; state that assumption when reporting numbers. It runs before the
+  plausibility filter, which then ranks the route-following samples.
 - **Collision cost covers each vehicle with 3 circles** along its long
   axis (radius = half-diagonal of one longitudinal slice), not exact
   oriented-box overlap. A single inscribing circle is not usable here: a

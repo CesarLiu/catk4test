@@ -236,3 +236,34 @@ def final_displacement_progress(
     any_valid = traj_valid.any(dim=-1)
     disp = torch.linalg.norm(last_pos - origin, dim=-1)
     return disp.masked_fill(~any_valid, 0.0)
+
+
+def logged_route(
+    pos_now: Tensor,  # [2]
+    future_pos: Tensor,  # [T, 2]
+    future_valid: Tensor,  # [T]
+    end_heading: Tensor,  # [] heading at the last logged point (rad)
+    extension: float = 100.0,
+) -> Tensor:  # [P, 2]
+    """The path an agent actually took, as a polyline: its current position,
+    its valid logged future positions, and a straight extension of
+    ``extension`` metres along ``end_heading``. The extension keeps a
+    counterfactual that drives the same path *faster* than the log on it, and
+    gives a stopped agent a path (straight ahead) to be measured against."""
+    points = [pos_now.unsqueeze(0), future_pos[future_valid]]
+    last = points[-1][-1] if points[-1].shape[0] > 0 else pos_now
+    direction = torch.stack([torch.cos(end_heading), torch.sin(end_heading)]).to(pos_now.dtype)
+    points.append((last + extension * direction).unsqueeze(0))
+    return torch.cat(points, dim=0)
+
+
+def lateral_deviation(points: Tensor, polyline: Tensor) -> Tensor:  # [..., 2], [P, 2] -> [...]
+    """Distance from each point to the nearest point of the polyline (its
+    segments, not only its vertices): how far off a path a position is,
+    whatever its progress along it."""
+    start, end = polyline[:-1], polyline[1:]  # [S, 2]
+    seg = end - start
+    rel = points[..., None, :] - start  # [..., S, 2]
+    t = (rel * seg).sum(-1) / (seg * seg).sum(-1).clamp(min=1e-9)
+    closest = start + t.clamp(0.0, 1.0)[..., None] * seg  # [..., S, 2]
+    return torch.linalg.norm(points[..., None, :] - closest, dim=-1).amin(dim=-1)
