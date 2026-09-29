@@ -3,6 +3,7 @@ tractable Boltzmann approximation to courtesy responsibility from Sec. V-B,
 Eq. 7, which we use in place of the intractable exact KL of Eq. 4).
 """
 
+import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -26,6 +27,10 @@ from src.responsibility.motion_set import (
 )
 from src.responsibility.risk import cvar
 
+
+OTHERS_LOGGED = "logged"
+OTHERS_CONSTANT_VELOCITY = "constant_velocity"
+OTHERS_FUTURES = (OTHERS_LOGGED, OTHERS_CONSTANT_VELOCITY)
 
 COURTESY_BOLTZMANN = "boltzmann"
 COURTESY_EXACT = "exact"
@@ -91,6 +96,20 @@ class ResponsibilityConfig:
     # exact estimator it is an approximation that drops weak far-field
     # influence. None disables it.
     courtesy_skip_distance: Optional[float] = 20.0
+    # Where the other agents' futures come from when scoring trajectories
+    # for the reward networks (their collision feature), in training and at
+    # prediction time alike. "constant_velocity" extrapolates their current
+    # state; "logged" reads their real future, which is fine for offline
+    # analysis but leaks the answer into online prediction: a candidate
+    # would be rewarded for avoiding where the others actually went.
+    others_future: str = OTHERS_CONSTANT_VELOCITY
+    # Fraction of the queried agent's samples, ranked by the model's mean
+    # per-token log-probability, that the safety CVaR is taken over. The
+    # motion set of Eq. (1a) is meant to hold what a reasonable driver might
+    # have done, but sampling the full 2048-token vocabulary also draws rare,
+    # erratic tokens -- and the upper-tail CVaR looks exactly at the samples
+    # that stray furthest. 1.0 keeps every sample (the paper's definition).
+    plausible_fraction: float = 1.0
 
 
 def future_slice(tensor: Tensor, num_historical_steps: int, horizon: Optional[int] = None) -> Tensor:
@@ -127,6 +146,38 @@ def ground_truth_boxes(
         length=shape[:, 0],
         width=shape[:, 1],
     )
+
+
+def extrapolated_boxes(
+    data, indices: Sequence[int], num_historical_steps: int, horizon: int
+) -> BoxTrajectories:
+    """The agents' next ``horizon`` steps under constant velocity and
+    heading from the current step -- a causal stand-in for their future,
+    valid wherever they are observed now."""
+    agent = data["agent"]
+    device = agent["position"].device
+    idx = torch.as_tensor(list(indices), dtype=torch.long, device=device)
+    now = num_historical_steps - 1
+    t = torch.arange(1, horizon + 1, device=device, dtype=agent["position"].dtype) * 0.1
+    pos = agent["position"][idx, now, :2][:, None, :] + agent["velocity"][idx, now][:, None, :] * t[None, :, None]
+    shape = agent["shape"][idx]
+    return BoxTrajectories(
+        pos=pos,
+        heading=agent["heading"][idx, now][:, None].expand(-1, horizon),
+        valid=agent["valid_mask"][idx, now][:, None].expand(-1, horizon),
+        length=shape[:, 0],
+        width=shape[:, 1],
+    )
+
+
+def others_future_boxes(data, indices: Sequence[int], cfg: "ResponsibilityConfig", horizon: int) -> BoxTrajectories:
+    """The other agents' futures used to score trajectories for the reward
+    networks; see ``ResponsibilityConfig.others_future``."""
+    if cfg.others_future == OTHERS_LOGGED:
+        return ground_truth_boxes(data, indices, cfg.num_historical_steps, horizon)
+    if cfg.others_future == OTHERS_CONSTANT_VELOCITY:
+        return extrapolated_boxes(data, indices, cfg.num_historical_steps, horizon)
+    raise ValueError(f"others_future must be one of {OTHERS_FUTURES}, got {cfg.others_future!r}")
 
 
 def rollout_boxes(
@@ -181,6 +232,22 @@ def _zero(data) -> Tensor:
 # ---------------------------------------------------------------------------
 
 
+def plausible_sample_indices(
+    token_log_prob: Tensor,  # [N, S]
+    token_valid: Tensor,  # [N, S]
+    fraction: float,
+) -> Tensor:  # [ceil(fraction * N)] long
+    """The most probable ``fraction`` of N samples by mean per-token log-
+    probability (at least one), in their original order."""
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError(f"plausible_fraction must be in (0, 1], got {fraction}")
+    n = token_log_prob.shape[0]
+    n_keep = max(1, math.ceil(fraction * n))
+    w = token_valid.to(token_log_prob.dtype)
+    score = (token_log_prob * w).sum(-1) / w.sum(-1).clamp(min=1.0)
+    return score.topk(n_keep).indices.sort().values
+
+
 def safety_from_rollouts(
     rollouts: Dict[str, Tensor],
     data,
@@ -195,6 +262,11 @@ def safety_from_rollouts(
 
     horizon = effective_horizon(data, cfg, rollouts["pred_traj_10hz"].shape[2])
     sampled_traj_a = rollouts["pred_traj_10hz"][:, 0, :horizon]  # [N, H, 2]
+    if cfg.plausible_fraction < 1.0:
+        keep = plausible_sample_indices(
+            rollouts["token_log_prob"][:, 0], rollouts["next_token_valid"][:, 0], cfg.plausible_fraction
+        )
+        sampled_traj_a = sampled_traj_a[keep]
     gt_a = ground_truth_boxes(data, [query_idx], cfg.num_historical_steps, horizon)
     gt_nb = ground_truth_boxes(data, list(neighbor_indices), cfg.num_historical_steps, horizon)
 

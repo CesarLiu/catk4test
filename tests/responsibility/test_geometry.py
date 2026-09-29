@@ -203,3 +203,29 @@ def test_final_displacement_progress_respects_validity():
     valid = torch.tensor([[True, True, False, False]])
     progress = final_displacement_progress(traj, valid, torch.zeros(2))
     assert torch.isclose(progress, torch.tensor([1.0]))
+
+
+def test_map_points_keep_only_vehicle_lane_centerlines():
+    import tests.responsibility.conftest  # noqa: F401  (stub before importing dataset_builder)
+    from src.responsibility.dataset_builder import get_map_points
+
+    traj_pos = torch.arange(5 * 3 * 2, dtype=torch.float).view(5, 3, 2)
+    data = {
+        "map_save": {"traj_pos": traj_pos},
+        # polygons: lane(freeway), lane(bike), road_edge, lane(surface street), crosswalk
+        "pt_token": {"pl_type": torch.tensor([0, 0, 1, 0, 3]), "type": torch.tensor([0, 3, 4, 1, 9])},
+    }
+    points = get_map_points(data)
+    assert points.shape == (2 * 3, 2)  # polylines 0 and 3, all three samples each
+    assert torch.equal(points, traj_pos[[0, 3]].reshape(-1, 2))
+    assert get_map_points(data, vehicle_lanes_only=False).shape == (5 * 3, 2)
+
+
+def test_map_points_fall_back_when_no_vehicle_lane_exists():
+    import tests.responsibility.conftest  # noqa: F401
+    from src.responsibility.dataset_builder import get_map_points
+
+    traj_pos = torch.zeros(2, 3, 2)
+    data = {"map_save": {"traj_pos": traj_pos},
+            "pt_token": {"pl_type": torch.tensor([3, 1]), "type": torch.tensor([9, 4])}}
+    assert get_map_points(data).shape == (6, 2)

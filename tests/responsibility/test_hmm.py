@@ -75,3 +75,17 @@ def test_forward_filter_is_a_valid_distribution():
     assert posterior.shape == (sequences[0].shape[0], 3)
     np.testing.assert_allclose(posterior.sum(axis=-1), 1.0, atol=1e-6)
     assert (posterior >= 0).all()
+
+
+def test_smoothing_is_a_distribution_and_uses_the_future():
+    sequences, _ = _make_two_level_sequences(n_seq=20, seed=11)
+    hmm = GaussianHMM(n_states=2, n_features=2, seed=12)
+    hmm.fit(sequences, n_iter=30)
+    obs = sequences[0]
+
+    smoothed = hmm.smooth(obs)
+    filtered = hmm.forward_filter(obs)
+
+    np.testing.assert_allclose(smoothed.sum(-1), 1.0, atol=1e-6)
+    # at the last step there is no future to add, so the two coincide
+    np.testing.assert_allclose(smoothed[-1], filtered[-1], atol=1e-6)

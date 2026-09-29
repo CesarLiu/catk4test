@@ -46,6 +46,9 @@ def parse_args():
     p.add_argument("--hidden-dim", type=int, default=32)
     p.add_argument("--n-epochs", type=int, default=300)
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--pool-levels", action="store_true",
+                   help="Train one reward network on all observations regardless of level (the "
+                        "H=1 ablation for evaluate_selection.py); it is stored as level 0.")
     add_model_args(p)
     add_responsibility_args(p)
     return p.parse_args()
@@ -54,6 +57,9 @@ def parse_args():
 def main():
     args = parse_args()
     observations = load_observations(args.labeled_observations)
+    if args.pool_levels:
+        for o in observations:
+            o.level = 0 if o.level is not None else None
     needed = {o.scenario_id for o in observations if o.level is not None}
     print(f"{len(observations)} observations across {len(needed)} scenarios need features.")
 

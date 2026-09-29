@@ -42,6 +42,7 @@ from src.responsibility.metrics import (
     responsibility_for_agents,
     effective_horizon,
     ground_truth_boxes,
+    others_future_boxes,
     rollout_boxes,
 )
 from src.responsibility.motion_set import (
@@ -74,11 +75,38 @@ class ResponsibilityObservation:
     interaction: Optional[Dict[int, Dict[str, float]]] = None
 
 
-def get_map_points(data) -> Optional[Tensor]:
+# Map encoding of src/data_preprocess.py: pt_token.pl_type indexes
+# ["lane", "road_edge", "road_line", "crosswalk"]; pt_token.type is the
+# point type, of which 0 (freeway) and 1 (surface street) are vehicle lanes
+# (3 is a bike lane; 4-5 road edges, 6-8 road lines, 9 crosswalks).
+LANE_POLYGON = 0
+VEHICLE_LANE_POINT_TYPES = (0, 1)
+
+
+def get_map_points(data, vehicle_lanes_only: bool = True) -> Optional[Tensor]:
+    """Reference points for the road-deviation cost: every sample point
+    (three per 5 m segment) of the vehicle-lane centerlines, so a vehicle
+    driving in a lane sits within about half a lane width of one. With
+    ``vehicle_lanes_only=False``, or when a map has no such lanes, every map
+    point is used (crosswalks, stop lines and road edges included)."""
     try:
-        return data["map_save"]["traj_pos"][:, 0]  # [n_pl, 2], one sample point per segment
+        traj_pos = data["map_save"]["traj_pos"]  # [n_pl, 3, 2]
     except (KeyError, IndexError):
         return None
+    if vehicle_lanes_only:
+        try:
+            pl_type, pt_type = data["pt_token"]["pl_type"], data["pt_token"]["type"]
+        except (KeyError, IndexError):
+            pl_type = pt_type = None
+        if pl_type is not None:
+            lanes = pl_type == LANE_POLYGON
+            vehicle = torch.zeros_like(lanes)
+            for t in VEHICLE_LANE_POINT_TYPES:
+                vehicle |= pt_type == t
+            keep = lanes & vehicle
+            if bool(keep.any()):
+                traj_pos = traj_pos[keep]
+    return traj_pos.reshape(-1, 2)
 
 
 def last_usable_window_step(
@@ -147,6 +175,7 @@ def compute_scenario_responsibility(
     max_agents: Optional[int] = None,
     steps: Optional[Sequence[int]] = None,
     agents: Optional[Sequence[int]] = None,
+    stats: Optional[Dict[str, int]] = None,
 ) -> List[ResponsibilityObservation]:
     """Responsibility observations (Eq. 3/4/5) for every agent matching
     ``agent_type_filter`` (default 0 = vehicle, the paper's vehicle-vehicle
@@ -175,7 +204,7 @@ def compute_scenario_responsibility(
         with shifted_context(data, k, cfg.num_historical_steps):
             observations.extend(
                 _responsibility_at_current_step(
-                    synthesizer, data, cfg, scenario_id, k, agent_type_filter, max_agents, agents
+                    synthesizer, data, cfg, scenario_id, k, agent_type_filter, max_agents, agents, stats
                 )
             )
     return observations
@@ -190,6 +219,7 @@ def _responsibility_at_current_step(
     agent_type_filter: Optional[int],
     max_agents: Optional[int],
     agents: Optional[Sequence[int]] = None,
+    stats: Optional[Dict[str, int]] = None,
 ) -> List[ResponsibilityObservation]:
     """``data`` must already be anchored so that ``cfg.num_historical_steps - 1``
     is the current step (see ``shifted_context``); ``k`` is only carried
@@ -237,10 +267,13 @@ def _responsibility_at_current_step(
 
     agents = list(neighbours_of)
     # one packed pass for every agent of this window (see ResponsibilityPlan)
-    results, _ = responsibility_for_agents(
+    results, plan = responsibility_for_agents(
         synthesizer, data, tokenized_map, tokenized_agent, agents, neighbours_of, all_idx, cfg,
         map_points=map_points,
     )
+    if stats is not None:
+        stats["windows"] = stats.get("windows", 0) + 1
+        stats["rollouts"] = stats.get("rollouts", 0) + plan.n_rollouts
     agent_id = data["agent"]["id"]
     observations = []
     for a in agents:
@@ -395,7 +428,8 @@ def _features_for_observation(
 
     horizon = effective_horizon(data, cfg, rollouts["pred_traj_10hz"].shape[2])
     gt_ego = ground_truth_boxes(data, [obs.agent_idx], cfg.num_historical_steps, horizon)
-    others = ground_truth_boxes(data, all_idx, cfg.num_historical_steps, horizon)
+    # the same source of the others' futures as at prediction time
+    others = others_future_boxes(data, all_idx, cfg, horizon)
     origin = data["agent"]["position"][obs.agent_idx, cfg.num_historical_steps - 1, :2]
 
     aux_ego = rollout_boxes(rollouts, 0, data["agent"]["shape"][obs.agent_idx], horizon)

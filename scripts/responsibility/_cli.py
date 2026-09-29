@@ -4,7 +4,7 @@ stage builds its ResponsibilityConfig the same way."""
 import argparse
 
 from src.responsibility.interaction import QUERY_MODES, SELECTION_MODES, InteractionConfig
-from src.responsibility.metrics import COURTESY_ESTIMATORS, DIRECTIONS, ResponsibilityConfig
+from src.responsibility.metrics import COURTESY_ESTIMATORS, DIRECTIONS, OTHERS_FUTURES, ResponsibilityConfig
 from src.responsibility.motion_set import NEIGHBOR_FUTURE_MODES
 
 
@@ -44,6 +44,13 @@ def add_responsibility_args(p: argparse.ArgumentParser) -> None:
                         "via the chain rule over replayed samples.")
     g.add_argument("--courtesy-skip-distance", type=float, default=d.courtesy_skip_distance,
                    help="Skip courtesy rollouts for pairs further apart (m); <=0 disables.")
+    g.add_argument("--others-future", default=d.others_future, choices=OTHERS_FUTURES,
+                   help="Future of the other agents when featurising trajectories for the reward "
+                        "networks: constant_velocity (causal; use for prediction) or logged "
+                        "(offline analysis only: leaks the answer into prediction).")
+    g.add_argument("--plausible-fraction", type=float, default=d.plausible_fraction,
+                   help="Take the safety CVaR over only this most-probable fraction of the "
+                        "queried agent's samples (1.0 keeps all, the paper's definition).")
     g.add_argument("--collision-weight", type=float, default=d.collision_weight)
     g.add_argument("--drivable-half-width", type=float, default=d.drivable_half_width)
     g.add_argument("--neighbor-future", default=d.neighbor_future, choices=NEIGHBOR_FUTURE_MODES,
@@ -86,6 +93,8 @@ def responsibility_config_from_args(args, num_historical_steps: int) -> Responsi
         drivable_half_width=args.drivable_half_width,
         courtesy_skip_distance=_none_if_nonpositive(args.courtesy_skip_distance),
         courtesy_estimator=args.courtesy_estimator,
+        others_future=args.others_future,
+        plausible_fraction=args.plausible_fraction,
         query_mode=args.query,
         query_direction=args.direction,
         interaction=InteractionConfig(

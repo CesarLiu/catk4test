@@ -174,6 +174,15 @@ class GaussianHMM:
             log_filt[t] = log_joint - logsumexp(log_joint)
         return np.exp(log_filt)
 
+    def smooth(self, obs: np.ndarray) -> np.ndarray:  # [T, H]
+        """Smoothed posterior p(z_k | beta_{1:T}) from forward-backward.
+
+        Uses observations *after* k, so it is not available online; it serves
+        as the oracle upper bound for how well levels could be known."""
+        obs = np.asarray(obs, dtype=np.float64)
+        gamma, _, _ = self._forward_backward(self._log_emission(obs))
+        return gamma
+
     def predict_level(self, obs: np.ndarray) -> np.ndarray:  # [T] int
         """z_k = argmax_z p(z | beta_{1:k}) at every step, Eq. (6)."""
         return self.forward_filter(obs).argmax(axis=-1)
