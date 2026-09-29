@@ -236,7 +236,49 @@ standing car makes every selector look alike; the speed is kept in the CSV.
 
 Rows are appended as they are computed; re-running skips finished scenarios.
 
-## 7. Troubleshooting
+## 7. Reward fine-tuning of SMART (stage 5)
+
+Instead of only re-ranking samples, fine-tune the model so that each
+agent's closed-loop behaviour scores well under its own level's reward, with
+an exact KL leash to the base model (method: [docs/responsibility.md](docs/responsibility.md#reward-based-fine-tuning-stage-5)).
+It needs stages 1-3 on the **training** scenarios (the levels and rewards),
+and optionally stages 1-2 on held-out scenarios for evaluation during
+training:
+
+```bash
+python -m scripts.responsibility.finetune_reward --ckpt ckpts/clsft_E9.ckpt \
+    --data-root data/womd_cache/training $R \
+    --labeled-observations logs/responsibility/run_train/labeled.pkl \
+    --reward-nets logs/responsibility/run_train/reward_nets.pt \
+    --val-data-root data/womd_cache/validation \
+    --val-labeled-observations logs/responsibility/run_sdc/labeled.pkl \
+    --out-dir logs/responsibility/finetune \
+    --steps 2000 --scenes-per-step 4 --n-rollouts 8 --lr 1e-5 --kl-coef 0.05
+```
+
+- `train_log.csv` / `eval_log.csv` track loss, reward, KL, collision rate
+  and ADE/minADE of the 2 s rollouts; the held-out evaluation also runs at
+  step 0, so the base model is the first row.
+- Keep `kl` small. The rewards were fitted against base-model samples and
+  are only trustworthy near that distribution. If the reward climbs while
+  ADE and collision rate get worse, raise `--kl-coef` or lower `--lr`.
+- `--resume` continues from `train_state.pt`; `last.ckpt` and
+  `step_*.ckpt` keep the base checkpoint's format.
+
+Compare the fine-tuned model with the base one on held-out scenes:
+
+```bash
+# its own samples, and responsibility-aware selection on top of them
+python -m scripts.responsibility.evaluate_selection --ckpt logs/responsibility/finetune/last.ckpt ...
+# closed-loop realism (WOSAC metrics), as scripts/local_val.sh runs it
+python -m src.run experiment=local_val trainer=default trainer.accelerator=gpu \
+    trainer.devices=1 trainer.strategy=auto task_name=local_val_finetuned \
+    ckpt_path=$PWD/logs/responsibility/finetune/last.ckpt
+```
+
+Run the same WOSAC command with `ckpt_path=$PWD/ckpts/clsft_E9.ckpt` for the base numbers.
+
+## 8. Troubleshooting
 
 | symptom | fix |
 |---|---|

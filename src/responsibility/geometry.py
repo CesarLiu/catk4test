@@ -151,9 +151,21 @@ def collision_cost(
     taken, then summed over timesteps and other agents. This is the
     ``c_coll`` term of the paper's Sec. V-B reward ``-10*c_coll - c_dev``.
     """
+    return collision_cost_matrix(ego, others, n_circles=n_circles, margin=margin).sum(dim=-1)
+
+
+def collision_cost_matrix(
+    ego: BoxTrajectories,
+    others: BoxTrajectories,
+    n_circles: int = 3,
+    margin: float = 0.0,
+) -> Tensor:  # [N, M]
+    """:func:`collision_cost` of every ego trajectory against every other
+    agent separately, summed over time; mask entries (e.g. an agent against
+    itself) before summing over the others."""
     n_ego = len(ego)
     if len(others) == 0 or ego.horizon == 0:
-        return torch.zeros(n_ego, device=ego.pos.device, dtype=ego.pos.dtype)
+        return torch.zeros(n_ego, len(others), device=ego.pos.device, dtype=ego.pos.dtype)
 
     ego_offsets, ego_radius = circle_decomposition(ego.length, ego.width, n_circles)
     other_offsets, other_radius = circle_decomposition(others.length, others.width, n_circles)
@@ -170,7 +182,7 @@ def collision_cost(
     penetration = penetration.amax(dim=(-2, -1))  # deepest circle pair -> [N, M, T]
 
     valid = ego.valid[:, None, :] & others.valid[None, :, :]  # [N, M, T]
-    return penetration.masked_fill(~valid, 0.0).sum(dim=(-2, -1))
+    return penetration.masked_fill(~valid, 0.0).sum(dim=-1)
 
 
 def road_deviation_cost(

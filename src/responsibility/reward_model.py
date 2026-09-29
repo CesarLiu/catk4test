@@ -50,10 +50,17 @@ class RewardNetBundle:
     feature_std: Tensor
 
     def reward(self, raw_features: Tensor) -> Tensor:
+        """Discriminator probability that a trajectory is logged, in (0, 1)."""
+        return torch.sigmoid(self.logit(raw_features))
+
+    def logit(self, raw_features: Tensor) -> Tensor:
+        """The same score before the sigmoid, log D / (1 - D): unbounded, so
+        it keeps ranking trajectories that the sigmoid saturates (the usual
+        reward for policy optimisation against a discriminator)."""
         # the nets are tiny and live on CPU; features may come from a GPU rollout
         device = raw_features.device
         normed = (raw_features.to(self.feature_mean.device) - self.feature_mean) / self.feature_std
-        return self.model.reward(normed).to(device)
+        return self.model(normed).to(device)
 
     def state_dict(self) -> Dict:
         return {

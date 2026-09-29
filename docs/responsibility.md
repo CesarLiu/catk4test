@@ -20,6 +20,7 @@ All code lives under `src/responsibility/`, with CLI drivers under
 | III-B, Eq. 2-5, Safety & courtesy responsibility | `metrics.py` | CVaR-based safety responsibility; Boltzmann/KL courtesy responsibility (Sec. V-B's tractable approximation) |
 | IV-A, HMM level abstraction | `hmm.py` | From-scratch Gaussian HMM (Baum-Welch EM), BIC model selection, Eq. 6 Bayes filter |
 | IV-B / V-C, Reward-dependent prediction | `reward_model.py`, `dataset_builder.py`, `selection.py` | Per-level IRL-style discriminator reward nets; online argmax-reward trajectory selection |
+| IV-B, Reward-based fine-tuning | `finetune.py`, `scripts/responsibility/finetune_reward.py` | KL-regularised group-relative policy gradient of SMART against each agent's level reward; see below |
 | V-B, Ex-post analysis | `scripts/responsibility/ex_post_analysis.py` | Safety/courtesy scatter by level, BIC-vs-H curve |
 
 ## Key adaptation: counterfactual rollouts inside a jointly-autoregressive model
@@ -281,6 +282,72 @@ All scripts run from the repo root (`catk/`) and load the SMART model
 config via a small dedicated Hydra tree, `configs/responsibility/eval.yaml`
 (see `src/responsibility/pipeline.compose_responsibility_config`), rather
 than the full `src/run.py` training entry point.
+
+## Reward-based fine-tuning (stage 5)
+
+Sec. IV-B says the per-level rewards can re-rank a predictor's outputs or
+fine-tune the predictor. Re-ranking is `selection.py`; fine-tuning is
+`finetune.py`, driven by `scripts/responsibility/finetune_reward.py`. It
+maximises the level reward of each agent's own behaviour under a KL leash
+to the base model:
+
+    max_theta  E_{tau ~ pi_theta} [ sum_a r_{z_a}(tau_a) ]
+               - kl_coef * sum_{a,t} KL( pi_theta(. | x_t) || pi_ref(. | x_t) )
+
+Per training scene and step:
+
+1. **K joint closed-loop rollouts** (`--n-rollouts`, default 8) of
+   `--horizon` steps (default: the metric horizon, 2 s) from the current
+   policy, every agent free, as in CAT-K's closed-loop fine-tuning. Tokens
+   are sampled from the *full* softmax at temperature 1, so they are exact
+   on-policy samples and their log-probabilities are the right ones for the
+   gradient (a truncated top-k would make them off-policy). The K copies run
+   as one batch.
+2. **Rewards** for every agent that has a level: the stage-2 label of its
+   window at the clip's current step (`level_table`; the agent's
+   responsibility toward all its neighbours is preferred over the
+   toward-the-SDC scope, and labels from windows more than
+   `--level-max-gap` steps away are not used). The reward is its level's
+   stage-3 network, on the stage-3 features of its rollout: collision with
+   the other agents' rollouts in the same scene copy (`--others rollout`;
+   `config` uses the stage-3 constant-velocity futures instead), road
+   deviation, progress, and the mean token log-probability under the
+   **frozen reference** model. Under the policy itself that last feature
+   would reward whatever the policy already prefers. By default the reward
+   is the discriminator logit log D/(1-D) (`--reward-transform logit`),
+   which keeps ranking rollouts that the sigmoid saturates.
+3. **Group-relative advantages**: per agent, (r - mean) / std over its K
+   rollouts (GRPO-style). No value network is needed, and a scene's
+   difficulty cancels out.
+4. **Loss** = -advantage x log pi_theta(the agent's own tokens), for the
+   rewarded agents, + `kl_coef` x the KL at every valid agent-step. The KL
+   is **exact**: both next-token distributions are available, and the
+   reference model's come from replaying the policy's tokens through it
+   (token forcing). The replay is checked to reproduce the rollout.
+
+Only CAT-K's fine-tuning parameter set trains by default (agent attention
+layers and token head); `--train-all` unfreezes everything. The model stays
+in eval mode (dropout off) while gradients flow. Credit assignment is per
+agent: an advantage multiplies only that agent's own token
+log-probabilities, although the other agents' rollouts shape its collision
+feature (the usual independent-learner simplification).
+
+Checkpoints keep the base checkpoint's Lightning format (its optimizer
+state dropped), so the fine-tuned `last.ckpt` works as `--ckpt` for every
+script here: selection evaluation, videos, and the WOSAC evaluation in
+`src/run.py`. What to compare, base vs fine-tuned, on held-out scenes:
+
+- `eval_log.csv` of the run: KL to the base, level reward, collision rate,
+  and ADE / minADE of the 2 s rollouts against the log.
+- `evaluate_selection.py --ckpt <fine-tuned>`: its `most_likely` and
+  `random` rows show whether the fine-tuned model's own samples moved closer
+  to the log, compared with the base model's.
+- WOSAC realism via `scripts/local_val.sh` with the fine-tuned checkpoint,
+  to check that closed-loop realism did not degrade.
+
+The rewards were fitted to discriminate logged from *base-model* behaviour,
+so they are only trustworthy near the base distribution; keep the KL small
+(watch `kl` in the logs) rather than optimising the reward far.
 
 ## Environment notes
 
