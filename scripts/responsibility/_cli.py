@@ -21,7 +21,8 @@ def add_model_args(p: argparse.ArgumentParser) -> None:
                    help="Scene copies per model call; 0 = auto (128 on GPU, 8 on CPU). "
                         "Tune with scripts/responsibility/benchmark_rollouts.py.")
     g.add_argument("--motion-set-num-k", type=int, default=2048,
-                   help="Top-k of the sampler; 2048 = the whole vocabulary, i.e. exact sampling.")
+                   help="Top-k of the sampler; 2048 = the whole vocabulary, i.e. exact sampling "
+                        "(required by --courtesy-estimator exact, as is --motion-set-temp 1).")
     g.add_argument("--motion-set-temp", type=float, default=1.0)
 
 

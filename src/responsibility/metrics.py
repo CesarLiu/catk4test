@@ -378,6 +378,26 @@ def _check_exact_supported(cfg: "ResponsibilityConfig") -> None:
         )
 
 
+def _check_exact_sampling(sampling_scheme, tokenized_agent: Dict[str, Tensor]) -> None:
+    """The exact estimator averages log pi(u | x) - log pi(u | x^-a) over the
+    target's sampled tokens, with both log-probabilities from the full
+    softmax, which is an unbiased KL only if the tokens were drawn from that
+    same full softmax. A truncated top-k or a temperature other than 1
+    samples from a different distribution, and the average then estimates
+    neither that distribution's KL nor the model's."""
+    n_token = int(tokenized_agent["token_traj"].shape[1])
+    criterium = sampling_scheme.get("criterium") if sampling_scheme is not None else None
+    num_k = int(sampling_scheme.get("num_k", 0)) if sampling_scheme is not None else 0
+    temp = float(sampling_scheme.get("temp", 1.0)) if sampling_scheme is not None else 1.0
+    if criterium != "topk_prob" or num_k < n_token or temp != 1.0:
+        raise ValueError(
+            'courtesy_estimator="exact" needs sampling from the full token distribution '
+            f"(criterium topk_prob, num_k >= {n_token}, temp 1.0); got criterium {criterium}, "
+            f"num_k {num_k}, temp {temp}. Use --motion-set-num-k {n_token} --motion-set-temp 1, "
+            'or courtesy_estimator="boltzmann".'
+        )
+
+
 def exact_courtesy_from_logits(
     with_logits: Tensor,  # [N, S, V] target's per-step logits along its own samples, a present
     without_logits: Tensor,  # [N, S, V] the same samples replayed with a removed
@@ -492,6 +512,8 @@ def responsibility_for_agents(
         raise ValueError(f"courtesy_estimator must be one of {COURTESY_ESTIMATORS}")
     _check_exact_supported(cfg)
     exact = cfg.courtesy_estimator == COURTESY_EXACT
+    if exact:
+        _check_exact_sampling(sampling_scheme or synthesizer.default_sampling_scheme, tokenized_agent)
     plan = plan_responsibility_jobs(data, queried, neighbors_of, cfg)
     common = dict(
         sampling_scheme=sampling_scheme,
@@ -595,6 +617,7 @@ def courtesy_responsibility_pair(
         return _zero(data)
     if cfg.courtesy_estimator == COURTESY_EXACT:
         _check_exact_supported(cfg)
+        _check_exact_sampling(sampling_scheme or synthesizer.default_sampling_scheme, tokenized_agent)
         common = dict(
             sampling_scheme=sampling_scheme,
             rollout_horizon=synthesizer.round_horizon(cfg.metric_horizon),

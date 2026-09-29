@@ -105,6 +105,18 @@ used by this repo's `WOSACMetrics`.
   zero (the two rewards differ only in the collision term against the
   queried agent). This is a compute shortcut with no effect on the
   non-zero values; set it to `0` to disable.
+- **Courtesy has two estimators** (`--courtesy-estimator`). `boltzmann` is
+  the paper's Sec. V-B proxy (Eq. 7): b's motions are reweighted by a
+  hand-made reward with and without a, so it is zero unless b's samples
+  come near a. `exact` is Eq. 4 itself: a tokenized model exposes b's full
+  next-token distribution with and without a. The KL is the chain-rule sum
+  over steps of log pi(u | x) - log pi(u | x^-a), averaged over b's sampled
+  tokens, which are replayed in the scene without a. That average is an
+  unbiased KL only when the tokens are drawn from the same full softmax, so
+  `exact` refuses a truncated top-k (`--motion-set-num-k` below the
+  vocabulary size) or a temperature other than 1. With those, the samples
+  come from another distribution and the average estimates neither its KL
+  nor the model's.
 - **How much future the queried agent sees is a switch**
   (`neighbor_future`, default `logged`). SMART rebuilds its interaction
   graph from the agents' current poses at every rollout step, so a

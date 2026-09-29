@@ -289,3 +289,12 @@ def sampling_scheme():
     from omegaconf import OmegaConf
 
     return OmegaConf.create({"criterium": "topk_prob", "num_k": 4, "temp": 1.0})
+
+
+@pytest.fixture
+def full_sampling_scheme():
+    """Sampling from the whole (stub) vocabulary, as the exact courtesy
+    estimator requires."""
+    from omegaconf import OmegaConf
+
+    return OmegaConf.create({"criterium": "topk_prob", "num_k": N_TOKEN, "temp": 1.0})
