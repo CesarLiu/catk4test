@@ -20,6 +20,11 @@ tuned cost, changing two things at once; responsibility vs pooled_reward
 isolates the level conditioning, and responsibility vs random_level
 checks that the levels carry information at all.
 
+Agents slower than --min-speed at the prediction step are skipped: for a
+car standing still every selector picks a near-stationary candidate and
+scores alike, which only dilutes the differences between them. The filter
+reads the current speed, so it is causal; set it to 0 to keep everyone.
+
 Rows go to --out-csv as they are computed (re-running skips finished
 scenarios); a summary with standard errors is printed at the end.
 
@@ -86,6 +91,8 @@ def parse_args():
                    help="Dataset index to start from; skip the scenarios the HMM and rewards were fitted on.")
     p.add_argument("--max-scenarios", type=int, default=None)
     p.add_argument("--max-agents-per-scenario", type=int, default=None)
+    p.add_argument("--min-speed", type=float, default=2.0,
+                   help="m/s; skip predictions for agents slower than this at the prediction step (0 keeps all).")
     p.add_argument("--seed", type=int, default=0)
     add_model_args(p)
     add_responsibility_args(p)
@@ -126,12 +133,15 @@ def main():
 
     out = Path(args.out_csv)
     out.parent.mkdir(parents=True, exist_ok=True)
+    fields = ["scenario_id", "agent_id", "is_sdc", "predict_step", "speed", "n_history", "level", "oracle_level"]
+    fields += [f"{s}_{m}" for s in SELECTORS for m in ("ade", "fde")]
     done = set()
     if out.exists():
         with open(out) as f:
-            done = {row["scenario_id"] for row in csv.DictReader(f)}
-    fields = ["scenario_id", "agent_id", "is_sdc", "predict_step", "n_history", "level", "oracle_level"]
-    fields += [f"{s}_{m}" for s in SELECTORS for m in ("ade", "fde")]
+            reader = csv.DictReader(f)
+            if reader.fieldnames is not None and reader.fieldnames != fields:
+                raise SystemExit(f"{out} was written with other columns; use a new --out-csv")
+            done = {row["scenario_id"] for row in reader}
     new_file = not out.exists()
     handle = open(out, "a", newline="")
     writer = csv.DictWriter(handle, fieldnames=fields)
@@ -147,9 +157,17 @@ def main():
         if scenario_id in done:
             continue
         now = num_hist - 1
-        agents = select_query_agents(data, now, cfg.query_mode, agent_type_from_args(args))
+        speed = torch.linalg.norm(data["agent"]["velocity"][..., :2], dim=-1)  # [n_agent, n_step]
+        n_step = speed.shape[1]
+        moving = {
+            a: [p for p in args.predict_steps if p < n_step and float(speed[a, p]) >= args.min_speed]
+            for a in select_query_agents(data, now, cfg.query_mode, agent_type_from_args(args))
+        }
+        # skip agents that never move fast enough before paying for their beta
+        agents = [a for a, ps in moving.items() if ps]
         agents = agents[: args.max_agents_per_scenario] if args.max_agents_per_scenario else agents
         if not agents:
+            print(f"{n_scen}: {scenario_id} no queried agent reaches {args.min_speed} m/s", flush=True)
             continue
 
         # beta over every window of the clip; causal slices of it feed the
@@ -167,7 +185,7 @@ def main():
                 continue
             betas = np.stack([o.beta.numpy() for o in seq])
             smoothed = hmm.smooth(betas)
-            for predict_step in args.predict_steps:
+            for predict_step in moving[a]:
                 causal = [i for i, o in enumerate(seq) if o.k + cfg.metric_horizon <= predict_step]
                 if not causal or predict_step > steps[-1] or not bool(data["agent"]["valid_mask"][a, predict_step]):
                     continue
@@ -197,6 +215,7 @@ def main():
                     "agent_id": int(data["agent"]["id"][a]),
                     "is_sdc": int(bool(data["agent"]["role"][a, 0])),
                     "predict_step": predict_step,
+                    "speed": f"{float(speed[a, predict_step]):.2f}",
                     "n_history": len(causal),
                     "level": level,
                     "oracle_level": oracle,

@@ -221,7 +221,9 @@ python -m scripts.responsibility.evaluate_selection --ckpt ckpts/clsft_E9.ckpt \
 
 At prediction steps 4.0/5.0/6.0/7.0 s it draws one set of K candidates per
 queried agent and lets every selector pick from the same set (paired
-comparison), printing mean ADE/FDE with standard errors:
+comparison), printing mean ADE/FDE with standard errors. Agents slower than
+`--min-speed` (default 2 m/s) at the prediction step are skipped, since a
+standing car makes every selector look alike; the speed is kept in the CSV.
 
 | selector | picks by |
 |---|---|
