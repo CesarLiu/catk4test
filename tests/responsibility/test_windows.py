@@ -152,11 +152,24 @@ def test_group_sequences_orders_by_context_step():
     ]
     grouped = group_sequences(obs)
 
-    assert set(grouped) == {("s", 7), ("s", 9)}
-    assert [o.k for o in grouped[("s", 7)]] == [10, 20, 30]
+    assert set(grouped) == {("s", 7, "neighbours"), ("s", 9, "neighbours")}
+    assert [o.k for o in grouped[("s", 7, "neighbours")]] == [10, 20, 30]
 
     sequences = sequences_as_arrays(grouped)
     lengths = sorted(len(s) for s in sequences)
     assert lengths == [1, 3]
     seq = next(s for s in sequences if len(s) == 3)
     assert list(seq[:, 0]) == [1.0, 2.0, 3.0]
+
+
+def test_group_sequences_keeps_scopes_apart():
+    """An agent's responsibility toward all its neighbours and toward the SDC
+    alone are different quantities and must not form one HMM sequence."""
+    obs = [
+        ResponsibilityObservation("s", 7, 0, k=10, beta=torch.tensor([1.0, 0.0])),
+        ResponsibilityObservation("s", 7, 0, k=10, beta=torch.tensor([2.0, 0.0]), scope="toward_sdc"),
+        ResponsibilityObservation("s", 7, 0, k=20, beta=torch.tensor([3.0, 0.0]), scope="toward_sdc"),
+    ]
+    grouped = group_sequences(obs)
+    assert len(grouped[("s", 7, "neighbours")]) == 1
+    assert [o.k for o in grouped[("s", 7, "toward_sdc")]] == [10, 20]

@@ -31,7 +31,12 @@ from src.responsibility.dataset_builder import (  # noqa: E402
     causal_window_steps,
     compute_scenario_responsibility,
 )
-from src.responsibility.metrics import ResponsibilityConfig, ground_truth_boxes  # noqa: E402
+from scripts.responsibility._cli import (  # noqa: E402
+    add_model_args,
+    add_responsibility_args,
+    responsibility_config_from_args,
+)
+from src.responsibility.metrics import ground_truth_boxes  # noqa: E402
 from src.responsibility.motion_set import MotionSetSynthesizer, shifted_context  # noqa: E402
 from src.responsibility.pipeline import (  # noqa: E402
     compose_responsibility_config,
@@ -47,14 +52,13 @@ from src.responsibility.selection import predict_responsibility_aware  # noqa: E
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--ckpt", required=True)
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--data-root", required=True)
     p.add_argument("--hmm", required=True)
     p.add_argument("--reward-nets", required=True)
-    p.add_argument("--model-config", default="smart")
     p.add_argument("--scenario-index", type=int, default=0)
-    p.add_argument("--agent-index", type=int, default=None, help="Defaults to the first valid vehicle.")
+    p.add_argument("--agent-index", type=int, default=None,
+                   help="Defaults to the self-driving car, else the first observed vehicle.")
     p.add_argument(
         "--predict-step",
         type=int,
@@ -62,19 +66,9 @@ def parse_args():
         help="Context step to predict from. Must leave room for at least one "
         "closed responsibility window before it and some logged future after.",
     )
-    p.add_argument("--window-stride", type=int, default=5)
-    p.add_argument("--metric-horizon", type=int, default=20)
     p.add_argument("--n-candidates", type=int, default=25)
-    p.add_argument("--motion-set-num-k", type=int, default=2048)
-    p.add_argument("--motion-set-temp", type=float, default=1.0)
-    p.add_argument("--rollout-batch-size", type=int, default=0, help="0 = auto")
-    p.add_argument("--neighbor-future", default="logged",
-                   choices=["logged", "hidden", "simulated"],
-                   help="How much of the neighbours' future the queried agent may "
-                        "condition on: logged (they replay their log and stay visible), "
-                        "hidden (visible only up to the current step; the paper's "
-                        "open-loop reading), simulated (nobody is teacher-forced).")
-    p.add_argument("--device", default="auto", help="cuda, cpu, or auto (cuda if available).")
+    add_model_args(p)
+    add_responsibility_args(p)
     return p.parse_args()
 
 
@@ -88,12 +82,7 @@ def main():
     data = load_scenario(args.data_root, args.scenario_index, device)
 
     num_historical_steps = hydra_cfg.model.model_config.decoder.num_historical_steps
-    rcfg = ResponsibilityConfig(
-        num_historical_steps=num_historical_steps,
-        metric_horizon=args.metric_horizon,
-        window_stride=args.window_stride,
-        neighbor_future=args.neighbor_future,
-    )
+    rcfg = responsibility_config_from_args(args, num_historical_steps)
     synthesizer = MotionSetSynthesizer(
         model,
         default_sampling_scheme(num_k=args.motion_set_num_k, temp=args.motion_set_temp),
@@ -103,12 +92,16 @@ def main():
     if args.agent_index is not None:
         query_idx = args.agent_index
     else:
-        veh_mask = (data["agent"]["type"] == 0) & data["agent"]["valid_mask"][:, args.predict_step]
-        query_idx = int(veh_mask.nonzero(as_tuple=True)[0][0])
-    print(f"Scenario {scenario_id_of(data)}, agent index {query_idx}")
+        observed = data["agent"]["valid_mask"][:, args.predict_step]
+        sdc = data["agent"]["role"][:, 0] & observed
+        vehicles = (data["agent"]["type"] == 0) & observed
+        pick = sdc if sdc.any() else vehicles
+        query_idx = int(pick.nonzero(as_tuple=True)[0][0])
+    role = "SDC" if bool(data["agent"]["role"][query_idx, 0]) else "agent"
+    print(f"Scenario {scenario_id_of(data)}, {role} index {query_idx}")
 
     # --- responsibility history: only windows already closed at the prediction step
-    steps = causal_window_steps(data, rcfg, synthesizer, args.predict_step, args.window_stride)
+    steps = causal_window_steps(data, rcfg, synthesizer, args.predict_step, rcfg.window_stride)
     if len(steps) == 0:
         raise ValueError(
             f"No responsibility window closes at or before step {args.predict_step}. "
@@ -116,12 +109,20 @@ def main():
             f"or shorten --metric-horizon."
         )
     observations = compute_scenario_responsibility(
-        synthesizer, data, rcfg, agent_type_filter=None, steps=steps
+        synthesizer, data, rcfg, agent_type_filter=None, steps=steps, agents=[query_idx]
     )
-    beta_history = torch.stack([o.beta for o in observations if o.agent_idx == query_idx])
-    print(f"beta history over context steps {steps}:")
-    for k, beta in zip(steps, beta_history):
-        print(f"  k={k:3d}  safety={beta[0]:.3f}  courtesy={beta[1]:.3f}")
+    history = sorted(
+        (o for o in observations if o.agent_idx == query_idx and o.scope == "neighbours"),
+        key=lambda o: o.k,
+    )
+    if not history:
+        raise ValueError(f"agent {query_idx} is not observed at any closed window {steps}")
+    beta_history = torch.stack([o.beta for o in history])
+    print("beta history (closed windows only):")
+    for o in history:
+        critical = max(o.per_neighbour.items(), key=lambda kv: kv[1][0], default=(None, None))[0]
+        print(f"  k={o.k:3d}  safety={o.beta[0]:.3f}  courtesy={o.beta[1]:.3f}  "
+              f"neighbours={len(o.per_neighbour)}  most safety-relevant={critical}")
 
     # --- prediction at the (later) prediction step
     with shifted_context(data, args.predict_step, num_historical_steps) as shifted:

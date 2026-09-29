@@ -54,3 +54,17 @@ num_historical_steps: 11 # must match configs/model/*.yaml decoder.num_historica
 agent_type_filter: 0 # 0=vehicle, 1=pedestrian, 2=cyclist, null=all (paper: vehicle-vehicle only)
 max_agents_per_scenario: null
 max_scenarios: null
+
+# --- who is queried, and against whom (src/responsibility/interaction.py) ---
+query_mode: vehicles # vehicles | sdc | interest | all
+query_direction: outgoing # with query_mode=sdc: outgoing | incoming | both
+interaction:
+  mode: geometric # radius | geometric | influence
+  prefilter_radius: 50.0 # m, candidates must be this close now
+  gap_threshold: 10.0 # m, closest footprint gap over the metric window
+  pet_threshold: 2.0 # s, post-encroachment time (= time headway when following)
+  pet_path_tolerance: 2.0 # m, "same place" for PET
+  ttc_threshold: 4.0 # s, constant-velocity time to collision
+  ttc_horizon: 6.0 # s of extrapolation for TTC
+  influence_threshold: 0.02 # nats per step, influence mode only
+  max_neighbors: 8 # strongest first; null keeps all

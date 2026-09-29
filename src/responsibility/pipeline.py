@@ -15,10 +15,10 @@ from torch_geometric.loader import DataLoader
 from src.responsibility.dataset_builder import (
     ResponsibilityObservation,
     assign_levels,
-    build_reward_training_features,
     compute_scenario_responsibility,
     group_sequences,
     sequences_as_arrays,
+    stream_reward_training_features,
     window_steps,
 )
 from src.responsibility.hmm import GaussianHMM, ModelSelectionResult, fit_hmm_with_model_selection
@@ -234,7 +234,7 @@ def label_observations_with_levels(
 def train_reward_stage(
     model: SMART,
     observations: List[ResponsibilityObservation],
-    data_by_scenario: Dict[str, object],
+    scenarios: Iterable[Tuple[str, object]],
     cfg: ResponsibilityConfig,
     n_aux: int = 24,
     sampling_scheme: Optional[DictConfig] = None,
@@ -243,12 +243,14 @@ def train_reward_stage(
     lr: float = 1e-3,
     rollout_batch_size: Optional[int] = None,
 ) -> Dict[int, RewardNetBundle]:
+    """``scenarios`` yields ``(scenario_id, data)`` and is consumed one
+    scenario at a time (see ``stream_reward_training_features``)."""
     synthesizer = MotionSetSynthesizer(
         model, sampling_scheme or default_sampling_scheme(), rollout_batch_size=rollout_batch_size
     )
-    level_features = build_reward_training_features(
+    level_features = stream_reward_training_features(
         synthesizer,
-        data_by_scenario,
+        scenarios,
         observations,
         cfg,
         n_aux=n_aux,

@@ -16,6 +16,7 @@ from src.responsibility.geometry import (
     pairwise_min_distance_over_time,
     road_deviation_cost,
 )
+from src.responsibility.interaction import InteractionConfig
 from src.responsibility.motion_set import (
     NEIGHBOR_FUTURE_LOGGED,
     MotionSetSynthesizer,
@@ -23,6 +24,12 @@ from src.responsibility.motion_set import (
     take_samples,
 )
 from src.responsibility.risk import cvar
+
+
+DIRECTION_OUTGOING = "outgoing"
+DIRECTION_INCOMING = "incoming"
+DIRECTION_BOTH = "both"
+DIRECTIONS = (DIRECTION_OUTGOING, DIRECTION_INCOMING, DIRECTION_BOTH)
 
 
 @dataclass
@@ -59,6 +66,16 @@ class ResponsibilityConfig:
     collision_margin: float = 0.0
     collision_weight: float = 10.0  # matches paper's R = -10*c_coll - c_dev
     drivable_half_width: float = 3.0
+    # Whose responsibility is measured: "vehicles" (every vehicle), "sdc" (the
+    # self-driving car only), "interest" (WOMD objects of interest / tracks
+    # to predict) or "all"; see interaction.select_query_agents.
+    query_mode: str = "vehicles"
+    # With query_mode="sdc": "outgoing" measures the SDC toward the agents it
+    # interacts with, "incoming" measures each of those agents toward the
+    # SDC, "both" does both (kept apart by ResponsibilityObservation.scope).
+    query_direction: str = DIRECTION_OUTGOING
+    # How the neighbour set of Eq. (5) is chosen; see interaction.py.
+    interaction: InteractionConfig = field(default_factory=InteractionConfig)
     # Courtesy is provably zero when the queried agent never enters the
     # collision term of the target's reward. Skipping those pairs before
     # rolling out saves the bulk of the compute; set to None to disable.

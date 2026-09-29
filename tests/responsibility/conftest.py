@@ -181,7 +181,15 @@ class FakeAgentEncoder:
                 batch_s=tokenized_agent["batch"].repeat(hist_step),
                 mask=pred_valid[:, :hist_step],
             )
+            # token 0's logit counts the agents present in the same scene copy,
+            # so removing someone shifts everyone else's distribution -- enough
+            # for influence tests, without the stub sampler looking at it
+            present = pred_valid[:, 1].float()
+            per_graph = torch.zeros(int(tokenized_agent["num_graphs"])).index_add_(
+                0, tokenized_agent["batch"], present
+            )
             next_token_logits = torch.zeros(n_agent, N_TOKEN)
+            next_token_logits[:, 0] = per_graph[tokenized_agent["batch"]]
             next_token_idx, _ = AGENT_DECODER_STUB.sample_next_token_traj(
                 token_traj=tokenized_agent["token_traj"],
                 token_traj_all=tokenized_agent["token_traj_all"],

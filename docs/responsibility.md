@@ -114,6 +114,54 @@ used by this repo's `WOSACMetrics`.
   paper's stated scope; pass `--agent-type -1` to include all types (the
   underlying dynamics/geometry code is not vehicle-specific).
 
+## Who is queried, and who counts as a neighbour
+
+`--query` picks whose responsibility is measured: `vehicles` (default,
+the paper's vehicle-vehicle scope), `sdc` (only the self-driving car,
+WOMD `role[:, 0]`), `interest` (WOMD objects of interest / tracks to
+predict) or `all`. With `--query sdc`, `--direction` chooses between the
+SDC's responsibility toward the agents it interacts with (`outgoing`),
+each of those agents' responsibility toward the SDC (`incoming`), or
+both; the two are stored with different `scope`s and never mixed into one
+HMM sequence.
+
+Responsibility is a max over neighbours (Eq. 5), so the neighbour set
+decides what it measures. `--neighbor-selection`:
+
+| mode | a candidate is a neighbour if ... |
+|---|---|
+| `radius` | it is within `--neighbor-radius` now (the original rule) |
+| `geometric` (default) | within `--prefilter-radius` now, and over the metric window its footprint gap is <= `--gap-threshold`, or its PET <= `--pet-threshold`, or its constant-velocity TTC <= `--ttc-threshold` |
+| `influence` | the geometric rule, or its model influence on the queried agent >= `--influence-threshold` |
+
+A plain radius misses fast crossing traffic that is still far away and
+admits cars that never close in (their safety term saturates to 0 but
+they still cost rollouts). The geometric evidence reads the same logged
+window as beta itself, so it adds no information beyond what beta uses:
+
+- **min gap**: closest approach of the two footprints (3-circle cover).
+- **PET** (post-encroachment time): the smallest time difference with
+  which the two occupy the same place, looking back over the observed
+  history too, as long as one of the two occupations is in the future.
+  For a car-following pair this is the time headway, which is why the
+  default threshold is 2 s (the two-second rule); at 3 s a car cruising
+  30 m behind at 10 m/s would count.
+- **TTC**: first time the footprints touch under constant velocity. It
+  uses the same circle cover as the gap: with bounding circles two cars
+  side by side in adjacent lanes would already "collide".
+
+**Model influence** of b on a is the exact KL, step by step along a's
+logged trajectory with every agent replaying its log, between a's
+next-token distribution with and without b in the scene -- the approach of
+the paper's reference [23], and Eq. (4) evaluated along the log. It costs
+one packed call of `1 + n_candidates` scene copies per window, because a
+single "b removed" copy yields every queried agent's distributions.
+
+Each observation keeps the evidence for every candidate considered
+(`interaction`, with a `selected` flag) and the per-neighbour betas before
+the max (`per_neighbour`), so thresholds can be recalibrated and the
+critical neighbour identified after the fact.
+
 ## Open-loop modes
 
 `--neighbor-future` selects what the queried agent conditions on while

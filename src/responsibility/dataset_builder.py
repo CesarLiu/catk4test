@@ -23,14 +23,21 @@ being scored against.
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 from torch import Tensor
 
 from src.responsibility.hmm import GaussianHMM
+from src.responsibility.interaction import (
+    QUERY_SDC,
+    select_interacting_neighbours,
+    select_query_agents,
+)
 from src.responsibility.metrics import (
+    DIRECTION_BOTH,
+    DIRECTION_INCOMING,
     ResponsibilityConfig,
     responsibility_for_agents,
     effective_horizon,
@@ -47,6 +54,10 @@ from src.responsibility.motion_set import (
 from src.responsibility.reward_model import extract_trajectory_features, mean_token_log_prob
 
 
+SCOPE_NEIGHBOURS = "neighbours"  # the agent toward all its interacting neighbours
+SCOPE_TOWARD_SDC = "toward_sdc"  # the agent toward the self-driving car only
+
+
 @dataclass
 class ResponsibilityObservation:
     scenario_id: str
@@ -55,6 +66,12 @@ class ResponsibilityObservation:
     k: int
     beta: Tensor  # [2]: (safety, courtesy)
     level: Optional[int] = None
+    # which neighbour set beta is a max over; sequences never mix scopes
+    scope: str = SCOPE_NEIGHBOURS
+    # neighbour agent id -> (safety, courtesy) before the max of Eq. (5)
+    per_neighbour: Optional[Dict[int, Tuple[float, float]]] = None
+    # neighbour agent id -> interaction evidence (min_gap, pet, ttc, influence)
+    interaction: Optional[Dict[int, Dict[str, float]]] = None
 
 
 def get_map_points(data) -> Optional[Tensor]:
@@ -129,13 +146,16 @@ def compute_scenario_responsibility(
     agent_type_filter: Optional[int] = 0,
     max_agents: Optional[int] = None,
     steps: Optional[Sequence[int]] = None,
+    agents: Optional[Sequence[int]] = None,
 ) -> List[ResponsibilityObservation]:
     """Responsibility observations (Eq. 3/4/5) for every agent matching
     ``agent_type_filter`` (default 0 = vehicle, the paper's vehicle-vehicle
     scope; ``None`` for all types), at each requested current step.
 
     ``steps`` defaults to the clip's native current step; pass the output
-    of :func:`window_steps` to get a per-agent sequence instead.
+    of :func:`window_steps` to get a per-agent sequence instead. ``agents``
+    restricts the query to those agent indices (still subject to being
+    observed at each step).
     """
     # data comes from a batch_size=1 DataLoader, so PyG collates
     # "scenario_id" (a per-graph, non-tensor attribute) into a length-1 list.
@@ -155,7 +175,7 @@ def compute_scenario_responsibility(
         with shifted_context(data, k, cfg.num_historical_steps):
             observations.extend(
                 _responsibility_at_current_step(
-                    synthesizer, data, cfg, scenario_id, k, agent_type_filter, max_agents
+                    synthesizer, data, cfg, scenario_id, k, agent_type_filter, max_agents, agents
                 )
             )
     return observations
@@ -169,6 +189,7 @@ def _responsibility_at_current_step(
     k: int,
     agent_type_filter: Optional[int],
     max_agents: Optional[int],
+    agents: Optional[Sequence[int]] = None,
 ) -> List[ResponsibilityObservation]:
     """``data`` must already be anchored so that ``cfg.num_historical_steps - 1``
     is the current step (see ``shifted_context``); ``k`` is only carried
@@ -177,57 +198,79 @@ def _responsibility_at_current_step(
     n_agent = data["agent"]["position"].shape[0]
     at_step = cfg.num_historical_steps - 1
     map_points = get_map_points(data)
-
-    candidates = [
-        i
-        for i in range(n_agent)
-        if (agent_type_filter is None or int(data["agent"]["type"][i]) == agent_type_filter)
-        and bool(data["agent"]["valid_mask"][i, at_step])
-    ]
-    if max_agents is not None:
-        candidates = candidates[:max_agents]
     all_idx = list(range(n_agent))
 
-    neighbors_of = {
-        a: find_neighbors(
-            data["agent"]["position"][..., :2],
-            data["agent"]["valid_mask"],
-            a,
-            at_step=at_step,
-            radius=cfg.neighbor_radius,
-        ).nonzero(as_tuple=True)[0].tolist()
-        for a in candidates
-    }
-    # one packed pass for every agent of this window (see ResponsibilityPlan)
-    results, _ = responsibility_for_agents(
+    if agents is not None:
+        observed = data["agent"]["valid_mask"][:, at_step]
+        queried = [int(a) for a in agents if bool(observed[int(a)])]
+    else:
+        queried = select_query_agents(data, at_step, cfg.query_mode, agent_type_filter)
+    if max_agents is not None:
+        queried = queried[:max_agents]
+    selection = select_interacting_neighbours(
         synthesizer,
         data,
-        tokenized_map,
-        tokenized_agent,
-        candidates,
-        neighbors_of,
-        all_idx,
-        cfg,
+        queried,
+        cfg.num_historical_steps,
+        effective_horizon(data, cfg),
+        cfg.interaction,
+        tokenized_map=tokenized_map,
+        tokenized_agent=tokenized_agent,
+        radius=cfg.neighbor_radius,
+    )
+    neighbours_of = dict(selection.neighbours)
+    scope_of = {a: SCOPE_NEIGHBOURS for a in queried}
+    interaction_of = {a: selection.diagnostics[a] for a in queried}
+
+    if cfg.query_mode == QUERY_SDC and cfg.query_direction in (DIRECTION_INCOMING, DIRECTION_BOTH):
+        # the reverse question: how responsible was each interacting agent
+        # toward the self-driving car
+        for ego in list(queried):
+            for b in selection.neighbours[ego]:
+                if b not in neighbours_of:
+                    neighbours_of[b] = [ego]
+                    scope_of[b] = SCOPE_TOWARD_SDC
+                    interaction_of[b] = {ego: selection.diagnostics[ego][b]}
+        if cfg.query_direction == DIRECTION_INCOMING:
+            for ego in queried:
+                del neighbours_of[ego], scope_of[ego], interaction_of[ego]
+
+    agents = list(neighbours_of)
+    # one packed pass for every agent of this window (see ResponsibilityPlan)
+    results, _ = responsibility_for_agents(
+        synthesizer, data, tokenized_map, tokenized_agent, agents, neighbours_of, all_idx, cfg,
         map_points=map_points,
     )
-    return [
-        ResponsibilityObservation(
-            scenario_id=str(scenario_id),
-            agent_id=int(data["agent"]["id"][a]),
-            agent_idx=a,
-            k=k,
-            beta=results[a]["beta"].detach().cpu(),
+    agent_id = data["agent"]["id"]
+    observations = []
+    for a in agents:
+        r = results[a]
+        per_neighbour = {
+            int(agent_id[b]): (float(r["safety"]["per_neighbor"].get(b, 0.0)),
+                               float(r["courtesy"]["per_neighbor"].get(b, 0.0)))
+            for b in neighbours_of[a]
+        }
+        observations.append(
+            ResponsibilityObservation(
+                scenario_id=str(scenario_id),
+                agent_id=int(agent_id[a]),
+                agent_idx=a,
+                k=k,
+                beta=r["beta"].detach().cpu(),
+                scope=scope_of[a],
+                per_neighbour=per_neighbour,
+                interaction={int(agent_id[b]): v for b, v in interaction_of[a].items()},
+            )
         )
-        for a in candidates
-    ]
+    return observations
 
 
 def group_sequences(
     observations: Sequence[ResponsibilityObservation],
-) -> Dict[Tuple[str, int], List[ResponsibilityObservation]]:
-    groups: Dict[Tuple[str, int], List[ResponsibilityObservation]] = {}
+) -> Dict[Tuple[str, int, str], List[ResponsibilityObservation]]:
+    groups: Dict[Tuple[str, int, str], List[ResponsibilityObservation]] = {}
     for obs in observations:
-        key = (obs.scenario_id, obs.agent_id)
+        key = (obs.scenario_id, obs.agent_id, getattr(obs, "scope", SCOPE_NEIGHBOURS))
         groups.setdefault(key, []).append(obs)
     for key in groups:
         groups[key].sort(key=lambda o: o.k)
@@ -269,20 +312,41 @@ def build_reward_training_features(
     """For every leveled observation, extracts the real trajectory's feature
     vector and ``n_aux`` auxiliary (freely sampled) trajectories' feature
     vectors, bucketed by responsibility level (Sec. IV-B/V-C)."""
-    buckets: Dict[int, Tuple[List[Tensor], List[Tensor]]] = {}
+    return stream_reward_training_features(
+        synthesizer, data_by_scenario.items(), observations, cfg, n_aux=n_aux, sampling_scheme=sampling_scheme
+    )
 
+
+def stream_reward_training_features(
+    synthesizer: MotionSetSynthesizer,
+    scenarios: Iterable[Tuple[str, "object"]],
+    observations: Sequence[ResponsibilityObservation],
+    cfg: ResponsibilityConfig,
+    n_aux: int = 24,
+    sampling_scheme=None,
+) -> Dict[int, LevelFeatureSet]:
+    """Same as :func:`build_reward_training_features`, but consuming
+    ``(scenario_id, data)`` pairs one at a time, so only the scenario being
+    processed is resident -- holding every scenario on the GPU at once does
+    not scale to a real dataset. Scenarios without leveled observations are
+    skipped; the features themselves are kept on CPU."""
+    by_scenario: Dict[str, List[ResponsibilityObservation]] = {}
     for obs in observations:
-        if obs.level is None:
-            continue
-        with shifted_context(
-            data_by_scenario[obs.scenario_id], obs.k, cfg.num_historical_steps
-        ) as data:
-            real_feat, fake_feat = _features_for_observation(
-                synthesizer, data, obs, cfg, n_aux, sampling_scheme
-            )
-        real_list, fake_list = buckets.setdefault(obs.level, ([], []))
-        real_list.append(real_feat.detach().cpu())
-        fake_list.append(fake_feat.detach().cpu())
+        if obs.level is not None:
+            by_scenario.setdefault(obs.scenario_id, []).append(obs)
+
+    buckets: Dict[int, Tuple[List[Tensor], List[Tensor]]] = {}
+    for scenario_id, scenario in scenarios:
+        for obs in by_scenario.pop(scenario_id, []):
+            with shifted_context(scenario, obs.k, cfg.num_historical_steps) as data:
+                real_feat, fake_feat = _features_for_observation(
+                    synthesizer, data, obs, cfg, n_aux, sampling_scheme
+                )
+            real_list, fake_list = buckets.setdefault(obs.level, ([], []))
+            real_list.append(real_feat.detach().cpu())
+            fake_list.append(fake_feat.detach().cpu())
+        if not by_scenario:
+            break
 
     return {
         level: LevelFeatureSet(real=torch.stack(real_list), fake=torch.cat(fake_list, dim=0))
