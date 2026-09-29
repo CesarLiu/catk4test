@@ -4,9 +4,15 @@ context step k of a clip, and stitches the frames into a video.
 Each frame re-anchors the clip at k (shifted_context), draws N samples of
 the queried agent's future from the model -- coloured by their model
 log-probability -- against its logged future, the logged future of the
-neighbour it interacts with most, and the map. The title carries that
-frame's safety responsibility towards the neighbour (Eq. 3), computed from
-the same samples over the paper's 2 s horizon.
+neighbour it interacts with most, and the map. A strip below the scene traces
+the safety responsibility towards that neighbour (Eq. 3) over the clip,
+computed from the same samples over the paper's 2 s horizon.
+
+By default the queried agent is the self-driving car and the neighbour is
+the agent with the tightest logged interaction with it over the clip
+(smallest post-encroachment time, then smallest footprint gap; see
+interaction.geometric_interaction). The view follows the pair at one zoom
+level for the whole video, wide enough for both and the drawn samples.
 
 Example:
     python -m scripts.responsibility.visualize_motion_sets \
@@ -30,6 +36,7 @@ from matplotlib.collections import LineCollection  # noqa: E402
 from matplotlib.patches import Polygon  # noqa: E402
 
 from src.responsibility.dataset_builder import window_steps  # noqa: E402
+from src.responsibility.interaction import most_interactive_neighbour  # noqa: E402
 from src.responsibility.metrics import ResponsibilityConfig, safety_responsibility_pair  # noqa: E402
 from src.responsibility.motion_set import (  # noqa: E402
     NEIGHBOR_FUTURE_MODES,
@@ -58,13 +65,16 @@ def parse_args():
     p.add_argument("--out-dir", required=True)
     p.add_argument("--model-config", default="smart")
     p.add_argument("--scenario-index", type=int, default=0)
-    p.add_argument("--agent-index", type=int, default=None, help="Queried agent; default: most interactive vehicle.")
-    p.add_argument("--neighbor-index", type=int, default=None)
+    p.add_argument("--agent-index", type=int, default=None,
+                   help="Queried agent; default: the self-driving car (else the closest vehicle pair).")
+    p.add_argument("--neighbor-index", type=int, default=None,
+                   help="Default: the agent interacting most tightly with the queried one.")
     p.add_argument("--n-samples", type=int, default=24)
     p.add_argument("--horizon", type=int, default=30, help="Rollout length @10Hz, multiple of 5.")
     p.add_argument("--stride", type=int, default=5, help="Context steps between frames.")
     p.add_argument("--neighbor-future", default="logged", choices=list(NEIGHBOR_FUTURE_MODES))
-    p.add_argument("--view-radius", type=float, default=50.0, help="Half-width of the view in metres.")
+    p.add_argument("--view-radius", type=float, default=None,
+                   help="Half-width of the view in metres; default: fit the pair and samples (25-80 m).")
     p.add_argument("--fps", type=float, default=2.0)
     p.add_argument("--motion-set-num-k", type=int, default=2048)
     p.add_argument("--motion-set-temp", type=float, default=1.0)
@@ -73,11 +83,15 @@ def parse_args():
     return p.parse_args()
 
 
-def pick_pair(data, first_step: int, last_step: int):
+def logged_throughout(data, first_step: int, last_step: int):
+    return data["agent"]["valid_mask"][:, first_step : last_step + 1].all(-1)
+
+
+def closest_vehicle_pair(data, first_step: int, last_step: int):
     """The vehicle pair, both logged throughout [first_step, last_step],
     that comes closest to each other in that interval."""
     pos = data["agent"]["position"][:, first_step : last_step + 1, :2]
-    valid = data["agent"]["valid_mask"][:, first_step : last_step + 1].all(-1)
+    valid = logged_throughout(data, first_step, last_step)
     candidates = torch.nonzero(valid & (data["agent"]["type"] == 0)).flatten().tolist()
     best = None
     for i, a in enumerate(candidates):
@@ -87,7 +101,12 @@ def pick_pair(data, first_step: int, last_step: int):
                 best = (a, b, gap)
     if best is None:
         raise RuntimeError("no pair of vehicles is logged over the whole clip; pass --agent-index")
-    return best
+    return best[:2]
+
+
+def default_query(data, first_step: int, last_step: int):
+    sdc = torch.nonzero(data["agent"]["role"][:, 0] & logged_throughout(data, first_step, last_step)).flatten()
+    return int(sdc[0]) if sdc.numel() else None
 
 
 def box_corners(center, heading, length, width):
@@ -97,9 +116,29 @@ def box_corners(center, heading, length, width):
     return np.stack([center[0] + c * dx - s * dy, center[1] + s * dx + c * dy], axis=-1)
 
 
-def render_frame(frame, map_segments, view_radius, title, subtitle):
-    fig, ax = plt.subplots(figsize=(8, 8), dpi=100)
-    cx, cy = frame["center"]
+def view_center(frame):
+    pts = [frame["query_now"][None], frame["samples"].reshape(-1, 2)]
+    if frame["neighbor_now"] is not None:
+        pts.append(frame["neighbor_now"][None])
+    pts = np.concatenate(pts)
+    return (pts.min(0) + pts.max(0)) / 2, pts
+
+
+def fit_view_radius(frames, margin=8.0, lo=25.0, hi=80.0):
+    """One half-width for the whole video: covers the pair and the drawn
+    samples in every frame, so the zoom does not jump between frames."""
+    need = 0.0
+    for f in frames:
+        center, pts = view_center(f)
+        need = max(need, float(np.abs(pts - center).max()))
+    return float(np.clip(need + margin, lo, hi))
+
+
+def render_frame(frame, map_segments, view_radius, title, timeline):
+    fig = plt.figure(figsize=(8, 10), dpi=100)
+    grid = fig.add_gridspec(2, 1, height_ratios=[4, 1], hspace=0.25)
+    ax = fig.add_subplot(grid[0])
+    cx, cy = view_center(frame)[0]
     ax.set_xlim(cx - view_radius, cx + view_radius)
     ax.set_ylim(cy - view_radius, cy + view_radius)
     ax.set_aspect("equal")
@@ -120,25 +159,37 @@ def render_frame(frame, map_segments, view_radius, title, subtitle):
     norm = plt.Normalize(vmin=lp.min(), vmax=lp.max() if lp.max() > lp.min() else lp.min() + 1e-6)
     cmap = plt.get_cmap("plasma")
     for i in order:
-        ax.plot(*frame["samples"][i].T, color=cmap(norm(lp[i])), lw=1.2, alpha=0.75, zorder=4)
+        ax.plot(*frame["samples"][i].T, color=cmap(norm(lp[i])), lw=1.8, alpha=0.8, zorder=4)
     sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
     cbar = fig.colorbar(sm, ax=ax, fraction=0.035, pad=0.02)
     cbar.set_label("mean per-step log p (model)")
 
     gt = frame["query_future"]
     if len(gt) > 1:
-        ax.plot(*gt.T, color="black", lw=2.2, ls="--", zorder=6, label="queried agent, logged future")
+        ax.plot(*gt.T, color="black", lw=1.3, ls="--", zorder=6, label="queried agent, logged future")
     nb = frame["neighbor_future"]
     if len(nb) > 1:
-        ax.plot(*nb.T, color=NEIGHBOR_COLOR, lw=2.0, ls="--", zorder=6, label="neighbour, logged future")
+        ax.plot(*nb.T, color=NEIGHBOR_COLOR, lw=1.3, ls="--", zorder=6, label="neighbour, logged future")
     ax.plot([], [], color=cmap(0.8), lw=1.5, label="counterfactual samples")
     ax.legend(loc="upper left", fontsize=8, framealpha=0.9)
 
     ax.set_title(title, fontsize=10)
-    ax.text(0.5, -0.07, subtitle, transform=ax.transAxes, ha="center", fontsize=9)
     ax.set_xlabel("x [m]")
     ax.set_ylabel("y [m]")
-    fig.tight_layout()
+
+    # responsibility over the clip so far; the full time range stays fixed
+    tl = fig.add_subplot(grid[1])
+    t_all, beta_all, upto = timeline["t"], timeline["beta"], timeline["upto"]
+    tl.axhline(0.0, color="#999999", lw=0.8)
+    tl.plot(t_all[: upto + 1], beta_all[: upto + 1], color=QUERY_COLOR, marker="o", ms=3, lw=1.5)
+    tl.plot(t_all[upto], beta_all[upto], color="black", marker="o", ms=6)
+    tl.set_xlim(t_all[0] - 0.5, t_all[-1] + 0.5)
+    span = max(0.5, float(np.abs(beta_all).max()) * 1.15)
+    tl.set_ylim(-0.1 * span, span)
+    tl.set_xlabel("context time t = k / 10 [s]")
+    tl.set_ylabel(r"$\beta_{safety}$ [m]")
+    tl.set_title(timeline["label"], fontsize=9)
+    tl.grid(alpha=0.3)
 
     fig.canvas.draw()
     image = np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()
@@ -199,16 +250,26 @@ def main():
 
     steps = window_steps(data, window_cfg, synth, stride=args.stride)
     n_step_total = data["agent"]["position"].shape[1]
-    if args.agent_index is not None and args.neighbor_index is not None:
-        a, j = args.agent_index, args.neighbor_index
+    first, last = steps[0], min(n_step_total - 1, steps[-1] + horizon)
+    a = args.agent_index if args.agent_index is not None else default_query(data, first, last)
+    j = args.neighbor_index
+    if a is None:
+        a, j = closest_vehicle_pair(data, first, last)
+        print(f"no self-driving car logged over the clip; closest vehicle pair {a}, {j}")
+    if j is None:
+        picked = most_interactive_neighbour(data, a, first, last)
+        if picked is None:
+            raise RuntimeError(f"agent {a} has no neighbour logged over the clip; pass --neighbor-index")
+        j, scores = picked
+        print(f"queried agent {a}, neighbour {j}: PET {scores['pet']:.1f} s, "
+              f"closest footprint gap {scores['min_gap']:.1f} m")
     else:
-        a, j, gap = pick_pair(data, steps[0], min(n_step_total - 1, steps[-1] + horizon))
-        print(f"queried agent {a}, neighbour {j} (closest approach {gap:.1f} m)")
+        print(f"queried agent {a}, neighbour {j}")
 
     map_pos = data["map_save"]["traj_pos"].cpu().numpy()  # [n_pl, 3, 2] polyline pieces
     map_segments = np.concatenate([map_pos[:, :-1, None], map_pos[:, 1:, None]], axis=2).reshape(-1, 2, 2)
 
-    images = []
+    frames = []
     for k in steps:
         with shifted_context(data, k, num_hist) as shifted:
             agent = shifted["agent"]
@@ -247,30 +308,39 @@ def main():
                     "box": box_corners(pos[i, now].cpu().numpy(), float(head[i, now]), float(shape[i, 0]), float(shape[i, 1])),
                     "history": pos[i, : now + 1][hist_mask].cpu().numpy(),
                 })
-            frame = {
-                "center": pos[a, now].cpu().numpy(),
+            frames.append({
+                "k": k,
+                "beta": float(beta),
+                "query_now": pos[a, now].cpu().numpy(),
+                "neighbor_now": pos[j, now].cpu().numpy() if bool(valid[j, now]) else None,
                 "agents": agents,
                 "samples": samples.cpu().numpy(),
                 "log_prob": log_prob.cpu().numpy(),
                 "query_future": pos[a, fut][valid[a, fut]].cpu().numpy(),
                 "neighbor_future": pos[j, fut][valid[j, fut]].cpu().numpy(),
-            }
+            })
+        print(f"k={k:3d}: sampled, beta_safety={float(beta):+.3f} m", flush=True)
 
+    if not frames:
+        raise RuntimeError("no frames rendered")
+    radius = args.view_radius or fit_view_radius(frames)
+    t_all = np.array([f["k"] / 10 for f in frames])
+    beta_all = np.array([f["beta"] for f in frames])
+    label = (f"safety responsibility of agent {a} towards agent {j} "
+             f"(CVaR$_{{{metric_cfg.cvar_alpha}}}$ over 2 s, d_sat {metric_cfg.d_sat:g} m)")
+    images = []
+    for n, frame in enumerate(frames):
+        k = frame["k"]
         title = (f"scenario {scenario_id}   k = {k}  (t = {k / 10:.1f} s)\n"
                  f"{args.n_samples} samples of agent {a}'s next {horizon / 10:.1f} s, "
                  f"neighbor_future = {args.neighbor_future}")
-        subtitle = (f"safety responsibility of agent {a} towards agent {j} "
-                    f"(CVaR$_{{{metric_cfg.cvar_alpha}}}$, 2 s, d_sat {metric_cfg.d_sat:g} m): "
-                    f"{float(beta):+.2f} m")
-        image = render_frame(frame, map_segments, args.view_radius, title, subtitle)
+        timeline = {"t": t_all, "beta": beta_all, "upto": n, "label": label}
+        image = render_frame(frame, map_segments, radius, title, timeline)
         plt.imsave(out_dir / "frames" / f"k_{k:03d}.png", image)
         images.append(image)
-        print(f"k={k:3d}: rendered, beta_safety={float(beta):+.3f} m", flush=True)
 
-    if not images:
-        raise RuntimeError("no frames rendered")
     gif_path, mp4 = write_video(images, out_dir, args.fps)
-    print(f"wrote {len(images)} frames to {out_dir / 'frames'}")
+    print(f"wrote {len(images)} frames to {out_dir / 'frames'} (view half-width {radius:.0f} m)")
     print(f"gif: {gif_path}")
     print(f"mp4: {mp4[0]} (codec {mp4[1]})" if mp4 else "mp4: opencv unavailable, gif only")
 

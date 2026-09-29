@@ -338,3 +338,30 @@ def select_interacting_neighbours(
             diag[b]["selected"] = 1.0
         neighbours[a], diagnostics[a] = keep, diag
     return NeighbourSelection(neighbours, diagnostics)
+
+
+def most_interactive_neighbour(
+    data,
+    query: int,
+    first_step: int,
+    last_step: int,
+    cfg: Optional[InteractionConfig] = None,
+    min_presence: float = 0.5,
+) -> Optional[Tuple[int, Dict[str, float]]]:
+    """The agent whose logged motion over [first_step, last_step] interacts
+    most tightly with ``query``, for picking one pair to show: smallest
+    post-encroachment time (someone passed through the same spot shortly
+    before or after), then closest footprint gap. Only agents logged for at
+    least ``min_presence`` of the interval are considered. Returns
+    ``(index, {"min_gap", "pet", "ttc"})`` or None."""
+    valid = data["agent"]["valid_mask"][:, first_step : last_step + 1]
+    present = torch.nonzero(valid.float().mean(-1) >= min_presence).flatten().tolist()
+    candidates = [i for i in present if i != query]
+    if not candidates:
+        return None
+    scores = geometric_interaction(
+        data, query, candidates, num_historical_steps=first_step + 1,
+        horizon=last_step - first_step, cfg=cfg or InteractionConfig(),
+    )
+    best = min(range(len(candidates)), key=lambda m: (float(scores["pet"][m]), float(scores["min_gap"][m])))
+    return candidates[best], {k: float(v[best]) for k, v in scores.items()}

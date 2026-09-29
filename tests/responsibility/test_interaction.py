@@ -10,6 +10,7 @@ from src.responsibility.interaction import (
     geometric_criteria,
     geometric_interaction,
     influence_matrix,
+    most_interactive_neighbour,
     select_interacting_neighbours,
     select_query_agents,
 )
@@ -224,3 +225,21 @@ def test_pet_ignores_a_conflict_entirely_in_the_past():
     # both passed the origin 0.5 s ago and are now driving apart
     data = _Data([[5, 0], [0, 5]], [[10, 0], [0, 10]])
     assert math.isinf(_geo(data, 0, [1])["pet"][0])
+
+
+def test_most_interactive_neighbour_prefers_a_path_crossing_over_a_parallel_car():
+    # 0 drives +x; 1 crosses 0's path at x=20 half a second after 0 passes;
+    # 2 drives alongside in the next lane, close but never on 0's path
+    data = _Data([[0, 0], [20, -25], [0, 4]], [[10, 0], [0, 10], [10, 0]])
+    picked, scores = most_interactive_neighbour(data, 0, NOW, N_STEP - 1)
+    assert picked == 1
+    assert scores["pet"] < 1.0
+    # without the crossing car, the closest one is the fallback
+    data = _Data([[0, 0], [0, 4], [0, 12]], [[10, 0], [10, 0], [10, 0]])
+    assert most_interactive_neighbour(data, 0, NOW, N_STEP - 1)[0] == 1
+
+
+def test_most_interactive_neighbour_needs_someone_present():
+    data = _Data([[0, 0], [5, 0]], [[10, 0], [10, 0]])
+    data["agent"]["valid_mask"][1] = False
+    assert most_interactive_neighbour(data, 0, NOW, N_STEP - 1) is None
