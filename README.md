@@ -99,7 +99,8 @@ Specifically you will find the data augmentation methods used by [SMART](https:/
 Autonomous Vehicles via Counterfactual Responsibility"](https://saferobotics.princeton.edu/research/responsibility)
 (IROS 2023) onto SMART/WOMD: counterfactual safety/courtesy responsibility metrics,
 an HMM-based responsibility-level abstraction, and per-level reward networks for
-fine-tuning or re-ranking predictions. See [docs/responsibility.md](docs/responsibility.md).
+fine-tuning or re-ranking predictions. See [docs/responsibility.md](docs/responsibility.md) for the method
+and [README_responsibility.md](README_responsibility.md) for server setup, runs and demos.
 
 ## Acknowledgement
 

@@ -61,12 +61,27 @@ used by this repo's `WOSACMetrics`.
   paper's in-text integral formula is written for the mirror-image
   (lower-tail) convention and does not itself reduce to that stated limit;
   see the docstring in `risk.py` for the full explanation.
-- **Road-deviation cost is a distance-to-nearest-map-point proxy**, not a
+- **Road-deviation cost is a distance-to-nearest-lane-point proxy**, not a
   true signed distance to the drivable polygon (which this repo's cached
-  WOMD map format does not reify). Use
-  `scripts/responsibility/inspect_map_types.py` to find which
-  `pt_token.pl_type` values are lanes/road edges in your cached data and
-  pre-filter `map_points` for a tighter approximation.
+  WOMD map format does not reify). The reference is the vehicle-lane
+  centerlines (`get_map_points(vehicle_lanes_only=True)`); road edges,
+  road lines and crosswalks are excluded, since distance to a road edge
+  would make driving *along* the edge look on-road.
+  `scripts/responsibility/inspect_map_types.py` checks this on real data.
+  On 20 validation scenarios, logged *moving* vehicles (> 1 m/s) are within
+  the 3 m tolerance of a lane point 97.3% of the time (99.4% against every
+  map point); stationary ones only 40.7% (76.7%), because parked cars sit
+  off the lane network. Since the cost scores motions, the lane reference
+  is the right one.
+- **Optionally, only the plausible part of the motion set enters the safety
+  CVaR** (`--plausible-fraction`, default 1.0 = off). The motion set of
+  Eq. (1a) is meant to hold what a reasonable driver might have done, but
+  sampling SMART's full 2048-token vocabulary also draws rare, erratic
+  tokens, and a sample that veers far away from the neighbour gains a lot
+  of margin -- exactly what the upper-tail CVaR averages over. With e.g.
+  `0.9`, the 10% of samples with the lowest mean per-token log-probability
+  are dropped before the CVaR; draw proportionally more samples to keep the
+  tail size. Courtesy is an expectation and is left unfiltered.
 - **Collision cost covers each vehicle with 3 circles** along its long
   axis (radius = half-diagonal of one longitudinal slice), not exact
   oriented-box overlap. A single inscribing circle is not usable here: a
@@ -219,17 +234,23 @@ the origin) before launching a full sweep.
 
 ## Pipeline
 
+Server setup, the sharded/resumable stage 1, the evaluation and the demos
+are walked through in [README_responsibility.md](../README_responsibility.md);
+`scripts/responsibility/demo.sh` runs everything below on a small slice.
+The minimal single-process form:
+
 ```bash
 # 1. Compute responsibility observations over a cached WOMD split
+#    (--out-dir: one file per scenario, resumable; --out: one pickle at the end)
 python -m scripts.responsibility.compute_responsibility \
     --ckpt /path/to/smart.ckpt \
     --data-root /path/to/cache/validation \
-    --out logs/responsibility/observations.pkl \
+    --out-dir logs/responsibility/stage1 \
     --max-scenarios 200
 
 # 2. Fit the HMM level abstraction (BIC sweep over H in {3,5,7,9,11})
 python -m scripts.responsibility.fit_hmm \
-    --observations logs/responsibility/observations.pkl \
+    --observations logs/responsibility/stage1 \
     --out-hmm logs/responsibility/hmm.pkl \
     --out-labeled logs/responsibility/observations_labeled.pkl \
     --out-summary logs/responsibility/hmm_summary.json
@@ -271,7 +292,8 @@ than the full `src/run.py` training entry point.
   pinned torch 2.4.
 - **`waymo-open-dataset` ships Linux wheels only.** On Windows, use WSL2
   (Ubuntu 22.04's Python 3.10 fits TF 2.12). Everything here runs on CPU,
-  just slowly.
+  just slowly. On Ubuntu 24.04 (Python 3.12), `install/setup_server.sh`
+  brings its own Python 3.11.
 - **The WOMD testing split has no future ground truth**, so responsibility,
   which is measured against the logged future, can only be computed on
   training or validation.
