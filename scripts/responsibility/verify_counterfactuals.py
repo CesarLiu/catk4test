@@ -232,6 +232,44 @@ def check_hidden(synth, data, report, a, j, horizon, num_hist, offset):
     )
 
 
+def check_replay(synth, data, report, a, j, horizon, n=4):
+    """Replay (forcing an agent onto given tokens) is what the exact courtesy
+    estimator stands on. Replaying stochastically sampled tokens in the same
+    context must reproduce the sampling pass's logits exactly; replaying
+    them with a neighbour removed must not."""
+    from src.responsibility.metrics import exact_courtesy_from_logits
+    from src.responsibility.motion_set import RolloutJob
+
+    tok_map, tok_agent = synth.tokenize(data)
+    common = dict(rollout_horizon=horizon, keep_logits=True)
+    (free,) = synth.run_jobs(tok_map, tok_agent, [RolloutJob(free=(a,), n_samples=n)], **common)
+    tokens = free["next_token_idx"][:, 0]
+    (same,) = synth.run_jobs(
+        tok_map, tok_agent, [RolloutJob(free=(), n_samples=n, outputs=(a,), replay={a: tokens})], **common
+    )
+    (without,) = synth.run_jobs(
+        tok_map, tok_agent, [RolloutJob(free=(), n_samples=n, removed=(j,), outputs=(a,), replay={a: tokens})],
+        **common,
+    )
+    valid = free["next_token_valid"][:, 0]
+    replayed_tokens = torch.equal(same["next_token_idx"][:, 0], tokens)
+    diff = _max_abs(free["next_token_logits"], same["next_token_logits"])
+    kl_same = float(exact_courtesy_from_logits(free["next_token_logits"][:, 0], same["next_token_logits"][:, 0], valid))
+    kl_without = float(exact_courtesy_from_logits(free["next_token_logits"][:, 0], without["next_token_logits"][:, 0], valid))
+    distinct = len({tuple(t.tolist()) for t in tokens})
+    report.add(
+        "replay reproduces sampled rollouts",
+        replayed_tokens and diff < LOGIT_TOL and kl_same < 1e-4,
+        f"{n} sampled rollouts ({distinct} distinct): tokens replayed exactly: {replayed_tokens}, "
+        f"max logit diff {diff:.2e}, KL {kl_same:.2e}",
+    )
+    report.add(
+        "exact courtesy detects the neighbour",
+        kl_without > 1e-3,
+        f"KL(p(xi_{a} | x) || p(xi_{a} | x without {j})) = {kl_without:.4f} nats over {horizon / 10:.1f} s",
+    )
+
+
 def check_plan(synth, data, report, num_hist, n_queried=4):
     """The packed, shared window plan must give the same betas as drawing
     every agent's and every pair's rollouts separately (argmax decoding
@@ -335,6 +373,9 @@ def main():
                        data, report, a, horizon, n=3)
         print("hidden")
         check_hidden(synth, data, report, a, j, horizon, num_hist, args.perturbation)
+        print("replay")
+        check_replay(MotionSetSynthesizer(model, default_sampling_scheme(), rollout_batch_size=4),
+                     data, report, a, j, horizon)
         print("plan")
         check_plan(MotionSetSynthesizer(model, argmax, rollout_batch_size=args.plan_batch_size),
                    data, report, num_hist)

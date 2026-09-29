@@ -158,3 +158,32 @@ def test_hidden_mode_survives_rollout_batching(sampling_scheme):
             block = mask[copy * N_AGENT : (copy + 1) * N_AGENT]
             assert block[FREE_IDX].all()
             assert not block[0].any() and not block[2].any()
+
+
+def test_ended_log_rows_hides_forced_agents_once_their_log_runs_out():
+    from src.responsibility.motion_set import ended_log_rows
+
+    valid = torch.ones(3, 18, dtype=torch.bool)
+    valid[0, 4:] = False  # forced agent 0: log ends at token column 4
+    valid[1, 3:] = False  # agent 1 is free: never hidden
+    free = torch.tensor([False, True, False])
+    rows = ended_log_rows(valid, free)
+
+    assert rows(0) is None  # the history step is never touched
+    assert not rows(2).any()  # columns 2..3 logged for agent 0
+    assert torch.equal(rows(3), torch.tensor([True, False, False]))  # column 4 missing
+    assert torch.equal(rows(10), torch.tensor([True, False, False]))  # stays hidden
+
+
+def test_logged_mode_drops_an_agent_when_its_log_ends(sampling_scheme):
+    model, synth, tok_map, tok_agent = _setup(sampling_scheme)
+    tok_agent["valid_mask"][2, 6:] = False  # neighbour 2's log ends at token column 6
+    synth.sample_rollouts(tok_map, tok_agent, free_agent_indices=[FREE_IDX], n_samples=1,
+                          neighbor_future=NEIGHBOR_FUTURE_LOGGED)
+
+    masks = model.encoder.seen_a2a_masks
+    # call t builds edges over the pose from token column 1 + t
+    for t, mask in enumerate(masks):
+        expect_visible = t < 5
+        assert bool(mask[2].all()) == expect_visible, f"call {t}"
+        assert mask[0].all() and mask[FREE_IDX].all()

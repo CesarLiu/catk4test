@@ -89,6 +89,32 @@ class _ForcedTokenSampler:
         return next_token_idx, next_token_traj_all
 
 
+def ended_log_rows(valid_mask: Tensor, free: Tensor):
+    """For logged mode: the forced agents whose log has run out.
+
+    A forced agent can only replay its log while it has a logged token; past
+    that point SMART would give it a *sampled* token, i.e. a random
+    continuation drawn afresh in every pass. Two passes that should differ
+    only in one agent (a counterfactual and its baseline, or a sample and
+    its replay) would then also differ in these agents. They are dropped
+    from the interaction graph from the step their log ends -- which is
+    also what the log says: they are no longer observed.
+
+    Returns ``rows_hidden_at`` for :func:`hide_agents_per_step`: at call t
+    the newest pose came from token column 1 + t, so a forced row is hidden
+    once any of its columns 2 .. 1 + t is unlogged.
+    """
+    forced = ~free
+
+    def rows_hidden_at(t: int):
+        if t == 0:
+            return None
+        ended = ~valid_mask[:, 2 : 2 + t].all(dim=-1)
+        return forced & ended
+
+    return rows_hidden_at
+
+
 @contextlib.contextmanager
 def force_ground_truth_tokens(tokenized_agent: Dict[str, Tensor], free_mask: Tensor):
     """Teacher-forces every agent outside ``free_mask`` onto its GT token."""
@@ -248,7 +274,7 @@ NEIGHBOR_FUTURE_MODES = (
 @contextlib.contextmanager
 def hide_agents_after_current_step(encoder, hidden_mask: Tensor):
     """Cuts the agent-agent attention edges of ``hidden_mask`` agents for
-    every rollout step after the first.
+    every rollout step after the first (see :func:`hide_agents_per_step`).
 
     ``SMARTAgentDecoder.inference`` rebuilds the interaction graph each
     step from the agents' *current* poses, so an agent teacher-forced onto
@@ -261,6 +287,19 @@ def hide_agents_after_current_step(encoder, hidden_mask: Tensor):
     the paper's "decision based on the current state and the interaction
     history" (Sec. VI-A).
     """
+    with hide_agents_per_step(encoder, lambda step: hidden_mask if step > 0 else None):
+        yield
+
+
+@contextlib.contextmanager
+def hide_agents_per_step(encoder, rows_hidden_at):
+    """Masks agents out of the agent-agent interaction graph, step by step.
+
+    ``rows_hidden_at(t)`` gives, for the t-th call of ``build_interaction_edge``
+    inside one ``.inference()`` (t = 0 builds the graph over the history
+    steps, t >= 1 over the pose produced by the previous step), a bool mask
+    of rows to drop, or None. Masked rows lose both in- and out-edges.
+    """
     owner = _horizon_owner(encoder)
     original = owner.build_interaction_edge
     state = {"calls": 0}
@@ -271,11 +310,11 @@ def hide_agents_after_current_step(encoder, hidden_mask: Tensor):
                 "build_interaction_edge is expected to be called with mask=...; "
                 "its call convention changed and neighbor-future hiding would silently break"
             )
-        step = state["calls"]
+        hidden = rows_hidden_at(state["calls"])
         state["calls"] += 1
-        if step > 0:  # call 0 covers the history steps
+        if hidden is not None:
             mask = kwargs["mask"].clone()
-            mask[hidden_mask] = False
+            mask[hidden] = False
             kwargs = {**kwargs, "mask": mask}
         return original(*args, **kwargs)
 
@@ -449,6 +488,8 @@ class MotionSetSynthesizer:
           so the free agent effectively foresees the real scene evolution.
           Faithful to "b replays its log", but more informed than the
           paper's open-loop assumption; biases safety responsibility up.
+          An agent whose log ends is dropped from the scene from then on,
+          rather than continued with a random sample (see ended_log_rows).
         - ``"hidden"``   they replay their logged tokens but drop out of
           the interaction graph after the current step, so the free agent
           decides on the current state and interaction history alone
@@ -547,6 +588,10 @@ class MotionSetSynthesizer:
                     stack.enter_context(force_ground_truth_tokens(rep_agent, rep_free))
                 if neighbor_future == NEIGHBOR_FUTURE_HIDDEN:
                     stack.enter_context(hide_agents_after_current_step(self.model.encoder, ~rep_free))
+                elif neighbor_future == NEIGHBOR_FUTURE_LOGGED:
+                    stack.enter_context(
+                        hide_agents_per_step(self.model.encoder, ended_log_rows(rep_agent["valid_mask"], rep_free))
+                    )
                 if split:
                     rep_feature = replicate_map(map_feature, n_graphs, len(chunk))
                     pred = encoder.agent_encoder.inference(rep_agent, rep_feature, scheme)

@@ -19,12 +19,17 @@ from src.responsibility.geometry import (
 from src.responsibility.interaction import InteractionConfig
 from src.responsibility.motion_set import (
     NEIGHBOR_FUTURE_LOGGED,
+    NEIGHBOR_FUTURE_SIMULATED,
     MotionSetSynthesizer,
     RolloutJob,
     take_samples,
 )
 from src.responsibility.risk import cvar
 
+
+COURTESY_BOLTZMANN = "boltzmann"
+COURTESY_EXACT = "exact"
+COURTESY_ESTIMATORS = (COURTESY_BOLTZMANN, COURTESY_EXACT)
 
 DIRECTION_OUTGOING = "outgoing"
 DIRECTION_INCOMING = "incoming"
@@ -76,9 +81,15 @@ class ResponsibilityConfig:
     query_direction: str = DIRECTION_OUTGOING
     # How the neighbour set of Eq. (5) is chosen; see interaction.py.
     interaction: InteractionConfig = field(default_factory=InteractionConfig)
-    # Courtesy is provably zero when the queried agent never enters the
-    # collision term of the target's reward. Skipping those pairs before
-    # rolling out saves the bulk of the compute; set to None to disable.
+    # How courtesy (Eq. 4) is estimated: "boltzmann" is the paper's Sec. V-B
+    # proxy (Eq. 7); "exact" is the KL between the model's own distributions
+    # over the target's motion with and without the queried agent, which a
+    # tokenized model makes computable (see exact_courtesy_from_logits).
+    courtesy_estimator: str = COURTESY_BOLTZMANN
+    # Pairs further apart than this are skipped before rolling out. For the
+    # Boltzmann proxy this is exact (its two rewards then coincide); for the
+    # exact estimator it is an approximation that drops weak far-field
+    # influence. None disables it.
     courtesy_skip_distance: Optional[float] = 20.0
 
 
@@ -224,9 +235,11 @@ def _empty_boxes(like: Tensor, horizon: int) -> BoxTrajectories:
 
 
 def courtesy_is_trivially_zero(data, query_idx: int, target_idx: int, cfg: ResponsibilityConfig) -> bool:
-    """True when the Boltzmann courtesy of (a, b) is provably 0 without any
-    rollout: no usable horizon, or the two agents stay further apart than
-    ``courtesy_skip_distance`` (the two rewards then differ in nothing)."""
+    """True when courtesy of (a, b) is not worth rolling out: no usable
+    horizon, or the two agents stay further apart than
+    ``courtesy_skip_distance``. For the Boltzmann proxy this is exact (the
+    two rewards then differ in nothing); for the exact estimator it drops
+    weak far-field influence."""
     horizon = effective_horizon(data, cfg)
     if horizon == 0:
         return True
@@ -282,6 +295,46 @@ def courtesy_from_rollouts(
     return (log_p1.exp() * (log_p1 - log_p2)).sum().clamp(min=0.0)
 
 
+def _check_exact_supported(cfg: "ResponsibilityConfig") -> None:
+    """The two contexts of the exact estimator must differ only in the
+    queried agent's presence. Under neighbor_future="simulated" the other
+    agents resample their futures in each pass, which would leak into the KL."""
+    if cfg.courtesy_estimator == COURTESY_EXACT and cfg.neighbor_future == NEIGHBOR_FUTURE_SIMULATED:
+        raise ValueError(
+            'courtesy_estimator="exact" needs neighbor_future "logged" or "hidden": '
+            "under simulated the other agents resample between the two contexts"
+        )
+
+
+def exact_courtesy_from_logits(
+    with_logits: Tensor,  # [N, S, V] target's per-step logits along its own samples, a present
+    without_logits: Tensor,  # [N, S, V] the same samples replayed with a removed
+    valid: Tensor,  # [N, S]
+) -> Tensor:  # scalar
+    """beta^courtesy_k(a, b, x_k) = KL( p(xi_b | x) || p(xi_b | x^{-a}) ), Eq. (4).
+
+    By the chain rule the trajectory KL is the expected sum of per-step
+    KLs between the two next-token distributions along prefixes drawn from
+    p(. | x):
+
+        KL(P || Q) = E_{xi ~ P} [ sum_t KL( p(. | xi_<t, x) || p(. | xi_<t, x^{-a}) ) ]
+
+    Each inner KL is exact (a categorical over the token vocabulary), so
+    averaging over the sampled prefixes gives an unbiased estimate with
+    lower variance than averaging whole-trajectory log-probability ratios.
+    """
+    log_p = torch.log_softmax(with_logits, dim=-1)
+    log_q = torch.log_softmax(without_logits, dim=-1)
+    per_step = (log_p.exp() * (log_p - log_q)).sum(-1).clamp(min=0.0)  # [N, S]
+    return (per_step * valid.to(per_step.dtype)).sum(-1).mean()
+
+
+def _replay_without(a: int, b: int, with_rollouts: Dict[str, Tensor]) -> RolloutJob:
+    """Target b replays its own sampled tokens in the scene without a."""
+    tokens = with_rollouts["next_token_idx"][:, 0]  # [N, S]
+    return RolloutJob(free=(), n_samples=tokens.shape[0], removed=(a,), outputs=(b,), replay={b: tokens})
+
+
 # ---------------------------------------------------------------------------
 # Planning: every rollout a context window needs, shared and packed
 # ---------------------------------------------------------------------------
@@ -309,10 +362,11 @@ class ResponsibilityPlan:
     full_job: Dict[int, int] = field(default_factory=dict)  # agent -> job index
     without_job: Dict[Tuple[int, int], int] = field(default_factory=dict)  # (a, b) -> job index
     courtesy_targets: Dict[int, List[int]] = field(default_factory=dict)  # a -> non-trivial b
+    replayed_rollouts: int = 0  # replay passes run after the plan (exact courtesy)
 
     @property
     def n_rollouts(self) -> int:
-        return sum(job.n_samples for job in self.jobs)
+        return sum(job.n_samples for job in self.jobs) + self.replayed_rollouts
 
 
 def plan_responsibility_jobs(
@@ -337,10 +391,13 @@ def plan_responsibility_jobs(
     for agent, n in full_n.items():
         plan.full_job[agent] = len(plan.jobs)
         plan.jobs.append(RolloutJob(free=(agent,), n_samples=n))
-    for a, targets in plan.courtesy_targets.items():
-        for b in targets:
-            plan.without_job[(a, b)] = len(plan.jobs)
-            plan.jobs.append(RolloutJob(free=(b,), removed=(a,), n_samples=cfg.n_courtesy_samples))
+    if cfg.courtesy_estimator == COURTESY_BOLTZMANN:
+        for a, targets in plan.courtesy_targets.items():
+            for b in targets:
+                plan.without_job[(a, b)] = len(plan.jobs)
+                plan.jobs.append(RolloutJob(free=(b,), removed=(a,), n_samples=cfg.n_courtesy_samples))
+    # the exact estimator instead replays each target's full-scene samples
+    # without a, which can only be planned once those samples exist
     return plan
 
 
@@ -359,15 +416,28 @@ def responsibility_for_agents(
     """beta = [beta^safety, beta^courtesy] for every queried agent of one
     context window, with all the rollouts they need drawn in one packed
     pass (see :class:`ResponsibilityPlan`)."""
+    if cfg.courtesy_estimator not in COURTESY_ESTIMATORS:
+        raise ValueError(f"courtesy_estimator must be one of {COURTESY_ESTIMATORS}")
+    _check_exact_supported(cfg)
+    exact = cfg.courtesy_estimator == COURTESY_EXACT
     plan = plan_responsibility_jobs(data, queried, neighbors_of, cfg)
-    results = synthesizer.run_jobs(
-        tokenized_map,
-        tokenized_agent,
-        plan.jobs,
+    common = dict(
         sampling_scheme=sampling_scheme,
         rollout_horizon=synthesizer.round_horizon(cfg.metric_horizon),
         neighbor_future=cfg.neighbor_future,
     )
+    results = synthesizer.run_jobs(tokenized_map, tokenized_agent, plan.jobs, keep_logits=exact, **common)
+
+    replayed: Dict[Tuple[int, int], Dict[str, Tensor]] = {}
+    if exact:
+        pairs = [(a, b) for a, targets in plan.courtesy_targets.items() for b in targets]
+        jobs = [
+            _replay_without(a, b, take_samples(results[plan.full_job[b]], cfg.n_courtesy_samples))
+            for a, b in pairs
+        ]
+        replay_results = synthesizer.run_jobs(tokenized_map, tokenized_agent, jobs, keep_logits=True, **common)
+        replayed = dict(zip(pairs, replay_results))
+        plan.replayed_rollouts = sum(job.n_samples for job in jobs)
 
     zero = _zero(data)
     out: Dict[int, Dict] = {}
@@ -382,16 +452,24 @@ def responsibility_for_agents(
 
         per_neighbor = {b: zero for b in neighbours}
         for b in plan.courtesy_targets.get(a, []):
-            per_neighbor[b] = courtesy_from_rollouts(
-                take_samples(results[plan.full_job[b]], cfg.n_courtesy_samples),
-                results[plan.without_job[(a, b)]],
-                data,
-                a,
-                b,
-                all_agent_indices,
-                cfg,
-                map_points=map_points,
-            )
+            with_b = take_samples(results[plan.full_job[b]], cfg.n_courtesy_samples)
+            if exact:
+                per_neighbor[b] = exact_courtesy_from_logits(
+                    with_b["next_token_logits"][:, 0],
+                    replayed[(a, b)]["next_token_logits"][:, 0],
+                    with_b["next_token_valid"][:, 0],
+                )
+            else:
+                per_neighbor[b] = courtesy_from_rollouts(
+                    with_b,
+                    results[plan.without_job[(a, b)]],
+                    data,
+                    a,
+                    b,
+                    all_agent_indices,
+                    cfg,
+                    map_points=map_points,
+                )
         courtesy_value = torch.stack(list(per_neighbor.values())).max() if per_neighbor else zero
         courtesy = {"per_neighbor": per_neighbor, "value": courtesy_value}
         out[a] = {"beta": torch.stack([safety["value"], courtesy["value"]]), "safety": safety, "courtesy": courtesy}
@@ -443,6 +521,26 @@ def courtesy_responsibility_pair(
     """beta^courtesy_k(a, b, x_k); see :func:`courtesy_from_rollouts`."""
     if courtesy_is_trivially_zero(data, query_idx, target_idx, cfg):
         return _zero(data)
+    if cfg.courtesy_estimator == COURTESY_EXACT:
+        _check_exact_supported(cfg)
+        common = dict(
+            sampling_scheme=sampling_scheme,
+            rollout_horizon=synthesizer.round_horizon(cfg.metric_horizon),
+            neighbor_future=cfg.neighbor_future,
+            keep_logits=True,
+        )
+        (with_b,) = synthesizer.run_jobs(
+            tokenized_map, tokenized_agent,
+            [RolloutJob(free=(target_idx,), n_samples=cfg.n_courtesy_samples)], **common,
+        )
+        (without_b,) = synthesizer.run_jobs(
+            tokenized_map, tokenized_agent, [_replay_without(query_idx, target_idx, with_b)], **common
+        )
+        return exact_courtesy_from_logits(
+            with_b["next_token_logits"][:, 0],
+            without_b["next_token_logits"][:, 0],
+            with_b["next_token_valid"][:, 0],
+        )
     with_rollouts, without_rollouts = synthesizer.run_jobs(
         tokenized_map,
         tokenized_agent,
