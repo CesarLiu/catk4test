@@ -24,6 +24,8 @@ cd /home/Cesar/catk
 git push origin main
 rsync -av womd_500_cache <h200>:<catk 目录>/
 rsync -av ckpts/clsft_E9.ckpt <h200>:<catk 目录>/ckpts/
+# 交通灯 / 停车标志来自缓存所依据的原始 ScenarioNet 场景
+rsync -av /home/Cesar/catspond-cr/raw_scenes_500 <h200>:<catk 目录>/
 ```
 
 ## 2. H200：拉取代码、准备环境
@@ -51,7 +53,7 @@ export TF_CPP_MIN_LOG_LEVEL=3 PYTHONWARNINGS=ignore
 
 ADV="0 12 55 62 68 75 86 136 149 176 210 227 234 242 250 283 304 313 319 343 366 376 378 384 387 398 418 430 464 478 488"
 SDC="480 420 99 197 436 318 423 127 76 123 257 279 342 353 433 482"
-COMMON="--ckpt ckpts/clsft_E9.ckpt --data-root womd_500_cache --query interest --ooi-neighbours --rollout-batch-size 256"
+COMMON="--ckpt ckpts/clsft_E9.ckpt --data-root womd_500_cache --raw-scenes raw_scenes_500 --query interest --ooi-neighbours --rollout-batch-size 256"
 
 for SET in boltzmann:logged exact:logged exact:hidden; do
   EST=${SET%%:*}; NF=${SET##*:}
@@ -84,10 +86,16 @@ done
 
 每帧的内容：
 
-- **左侧场景**：地图；所有 agent，粗黑边是车头；被查询 agent 的 motion set，按模型的平均 per-token log p 着色；它的 logged future（黑色虚线）；邻居和邻居的 logged future（蓝色虚线）。决定 β_s 的邻居描红边，决定 β_c 的描蓝边，两者是同一个邻居时描紫边。
+- **左侧场景**：地图；交通灯（停止线处的圆点，颜色是 t_k 时刻的灯态：红、黄、绿，灰色表示未知）；停车标志（红色八边形）；所有 agent，粗黑边是车头；被查询 agent 的 motion set，按模型的平均 per-token log p 着色；它的 logged future（黑色虚线）；邻居和邻居的 logged future（蓝色虚线）。决定 β_s 的邻居描红边，决定 β_c 的描蓝边，两者是同一个邻居时描紫边。
 - **右侧 courtesy**：
   - boltzmann：b 合并后的样本按 log P1/P2 着色，旁边是 P1 和 P2 的柱状图。
   - exact：b 的样本按各自的 KL 项着色，旁边是这些 KL 项的柱状图。
+- **中间一行**：
+  - β_s 的主要贡献：被查询 agent 中 C = D(样本) − D(logged) 最大的 `--top-k` 条样本（默认 5 条），对照邻居的 GT 轨迹，点线标出最近接近点。
+  - β_c 的主要贡献：b 的样本里贡献最大的几条，对照被查询 agent 的 GT 轨迹。
+  - 两个 OOI 的速度曲线：红色是被查询 agent，蓝色是另一个 OOI；horizon 内同时画出 motion set 的速度。
+  - 轨迹上每 0.5 s 打一个点，方便对照同一时刻的位置。
+  - 这些都从 record 计算，所以 H200 上已经跑出来的旧 record 也能直接重画（见第 5 节）。
 - **下方**：β_s 和 β_c 随时间的曲线。给了 `--hmm` 时，背景按 HMM 滤波得到的 level 着色。
 
 ## 5. 从 record 重画（不需要模型）
@@ -97,7 +105,7 @@ done
 ```bash
 python -m scripts.responsibility.visualize_responsibility \
     --record logs/responsibility/aggressive_ooi_boltzmann_logged/adv/*/record.pkl \
-    --hmm logs/responsibility/hmm.pkl \
+    --raw-scenes raw_scenes_500 --hmm logs/responsibility/hmm.pkl \
     --out-dir logs/responsibility/aggressive_ooi_boltzmann_logged/adv_rerender
 ```
 

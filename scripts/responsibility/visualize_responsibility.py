@@ -12,16 +12,30 @@ Each frame shows
             --route-consistent, in grey), its logged future, and the
             neighbours beta was taken over with their logged futures; the
             neighbour behind beta_s is outlined in red, the one behind beta_c
-            in blue (purple when both)
+            in blue (purple when both); with --raw-scenes, traffic lights at
+            their stop points in their state at k, and stop signs
   courtesy  that neighbour's samples behind beta_c:
               boltzmann  its pooled samples coloured by log P1/P2 (how much
                          the agent's logged future costs each one), and P1
                          against P2
               exact      its samples coloured by their term of the KL
                          (summed per-step KL), and those terms
+  contributions
+            the --top-k samples that contribute most to beta_s (the agent's,
+            by C = D(sample) - D(logged), recomputed from the record exactly
+            as the pipeline scores them) against the neighbour's logged
+            trajectory, with each one's closest approach; and to beta_c (the
+            target's, by its KL term) against the agent's logged trajectory.
+            Dots every 0.5 s match co-temporal positions
+  speed     logged speed of the queried agent (red) and the other objects of
+            interest (blue) over the clip; within the horizon, the motion
+            set's speeds, the top beta_s samples in their panel's colours
   timeline  beta_s (m) and beta_c (nats) over the clip, the current window
             marked; with --hmm, the filtered level of every window (Eq. 6)
             as background colour
+
+Records written before the speed panel existed render too (the other object
+of interest is then taken to be the agent's most frequent neighbour).
 
 Two ways to run it:
 
@@ -101,6 +115,12 @@ def parse_args():
     p.add_argument("--hmm", default=None, help="hmm.pkl from fit_hmm.py: levels as the timeline's background.")
     p.add_argument("--view-radius", type=float, default=None, help="m; default: fitted to the clip (25-80 m).")
     p.add_argument("--fps", type=float, default=2.0)
+    p.add_argument("--raw-scenes", default=None,
+                   help="Directory of the ScenarioNet scenes the cache was built from (e.g. catspond's "
+                        "raw_scenes_500), read as <dir>/<scenario file>.pkl: draws traffic lights (state at "
+                        "every t_k) and stop signs in the scene panel. Live runs store them in record.pkl.")
+    p.add_argument("--top-k", type=int, default=5,
+                   help="Samples shown in the beta_s / beta_c contribution panels (largest contribution first).")
     live = p.add_argument_group("live mode")
     live.add_argument("--data-root", default=None)
     live.add_argument("--agent", nargs="+", default=["sdc"],
@@ -198,6 +218,7 @@ def scene_snapshot(data) -> Dict:
         "type": agent["type"],
         "id": agent["id"],
         "is_sdc": agent["role"][:, 0],
+        "is_ooi": agent["role"][:, 1],
         "map_pos": data["map_save"]["traj_pos"],
         "map_type": data["pt_token"]["pl_type"],
     })
@@ -225,6 +246,9 @@ def live_records(args) -> Iterator[Tuple[str, Dict]]:
     synth = MotionSetSynthesizer(model, default_sampling_scheme(**sampling),
                                  rollout_batch_size=args.rollout_batch_size or None)
     several = len(args.scenario_index) * len(args.agent) > 1
+    from src.responsibility.results_io import scenario_files
+
+    files = scenario_files(args.data_root)
     for index in args.scenario_index:
         data = load_scenario(args.data_root, index, device)
         scenario_id = scenario_id_of(data, str(index))
@@ -264,6 +288,7 @@ def live_records(args) -> Iterator[Tuple[str, Dict]]:
                 "version": RECORD_VERSION,
                 "scenario_id": scenario_id,
                 "scenario_index": index,
+                "scenario_file": files[index].stem,
                 "agent": a,
                 "agent_id": int(data["agent"]["id"][a]),
                 "config": asdict(cfg),
@@ -277,6 +302,72 @@ def live_records(args) -> Iterator[Tuple[str, Dict]]:
 # ----------------------------------------------------------------------------
 # rendering (from records only)
 # ----------------------------------------------------------------------------
+
+
+# ScenarioNet lane states -> 0 unknown, 1 stop (red), 2 caution (yellow), 3 go (green)
+LIGHT_CODE = {"STOP": 1, "CAUTION": 2, "GO": 3}
+LIGHT_COLOR = {0: "#9a9a9a", 1: "#e41a1c", 2: "#ffbf00", 3: "#2ca02c"}
+LIGHT_NAME = {0: "unknown", 1: "stop", 2: "caution", 3: "go"}
+
+
+def light_code(state: str) -> int:
+    """LANE_STATE_[ARROW_|FLASHING_]{STOP,CAUTION,GO}, UNKNOWN or None."""
+    return next((c for key, c in LIGHT_CODE.items() if str(state).endswith(key)), 0)
+
+
+def load_signals(raw_dir, record) -> Dict:
+    """Traffic lights (stop point and state per step) and stop signs of the
+    record's scenario, from the ScenarioNet scene it was cached from. Refuses
+    a file whose self-driving car is not where the record's is."""
+    scene = record["scene"]
+    path = Path(raw_dir) / f"{record.get('scenario_file', record['scenario_id'])}.pkl"
+    with open(path, "rb") as f:
+        raw = pickle.load(f)
+    sdc = int(np.flatnonzero(scene["is_sdc"])[0])
+    track = raw["tracks"][str(raw["metadata"]["sdc_id"])]["state"]
+    step = int(raw["metadata"].get("current_time_index", 10))
+    offset = np.linalg.norm(np.asarray(track["position"])[step, :2] - scene["position"][sdc, step])
+    if offset > 1.0:
+        raise SystemExit(f"{path} does not match the record: its SDC is {offset:.1f} m from the record's")
+    lights = [v for v in raw["dynamic_map_states"].values() if v.get("type") == "TRAFFIC_LIGHT"]
+    stops = [np.asarray(f["position"])[:2] for f in raw["map_features"].values() if f.get("type") == "STOP_SIGN"]
+    return {
+        "light_pos": np.array([np.asarray(v["stop_point"])[:2] for v in lights]).reshape(-1, 2),
+        "light_state": (np.array([[light_code(x) for x in v["state"]["object_state"]] for v in lights], dtype=np.int8)
+                        if lights else np.zeros((0, scene["valid"].shape[1]), dtype=np.int8)),
+        "stop_sign_pos": np.array(stops).reshape(-1, 2),
+    }
+
+
+def draw_signals(ax, signals, k) -> List:
+    """Traffic lights at their stop points coloured by their state at k, and
+    stop signs; returns legend handles for those inside the view (call after
+    the axis limits are set)."""
+    (x0, x1), (y0, y1) = ax.get_xlim(), ax.get_ylim()
+
+    def inside(pts):
+        return (pts[:, 0] >= x0) & (pts[:, 0] <= x1) & (pts[:, 1] >= y0) & (pts[:, 1] <= y1)
+
+    handles = []
+    pos, state = signals["light_pos"], signals["light_state"]
+    seen = inside(pos)
+    pos, state = pos[seen], state[seen]
+    if len(pos):
+        now = state[:, min(k, state.shape[1] - 1)]
+        ax.scatter(*pos.T, s=50, c=[LIGHT_COLOR[int(c)] for c in now], marker="o", edgecolors="black",
+                   linewidths=1.6, zorder=6.5)
+        for c in sorted(set(int(c) for c in now)):
+            handles.append(plt.Line2D([], [], ls="", marker="o", ms=7, mfc=LIGHT_COLOR[c], mec="black", mew=1.6,
+                                      label=f"traffic light: {LIGHT_NAME[c]}"))
+    stops = signals["stop_sign_pos"][inside(signals["stop_sign_pos"])]
+    if len(stops):
+        # a red octagon with a white rim on a black outline, so it reads apart from a red light
+        ax.scatter(*stops.T, s=230, c="black", marker="8", linewidths=0, zorder=6.4)
+        ax.scatter(*stops.T, s=150, c="#c00000", marker="8", edgecolors="white",
+                   linewidths=1.6, zorder=6.5)
+        handles.append(plt.Line2D([], [], ls="", marker="8", ms=11, mfc="#c00000", mec="white", mew=1.6,
+                                  label="stop sign"))
+    return handles
 
 
 def map_segments(scene) -> Dict[Tuple[str, float], np.ndarray]:
@@ -409,6 +500,8 @@ def draw_scene(ax, scene, agent, frame, groups, radius, horizon):
     ]
     if n_kept < n_all:
         handles.insert(1, plt.Line2D([], [], color="#b5b5b5", lw=1.0, label="left out of the CVaR"))
+    if "signals" in scene:
+        handles += draw_signals(ax, scene["signals"], k)
     ax.legend(handles=handles, loc="upper left", fontsize=6.5, framealpha=0.85)
     ax.set_xticks([])
     ax.set_yticks([])
@@ -505,6 +598,226 @@ def draw_courtesy(axes, scene, agent, frame, groups, radius, horizon, cfg):
     cax.tick_params(labelsize=6)
 
 
+STEP_DOTS = 5  # mark every 0.5 s along the trajectories of the contribution panels
+TOP_COLORS = ["#d62728", "#ff7f0e", "#9467bd", "#8c564b", "#e377c2", "#bcbd22", "#17becf", "#7f7f7f"]
+
+
+def safety_contributions(scene, agent, frame, b, cfg) -> Optional[Dict]:
+    """Each sample's term of beta_s toward ``b`` (Eq. 2-3), recomputed from
+    the record exactly as safety_responsibility_pair does it:
+
+        C_j = D(sample_j, b) - D(logged, b),  D = saturated min_t distance
+        beta_s = mean of C_j over the CVaR tail C_j >= VaR_alpha(C)
+
+    Returns the sample indices (into frame["safety"]["samples"]), C, the
+    tail mask, each one's time of closest approach, and beta_s."""
+    safety = frame["safety"]
+    if safety is None or b is None:
+        return None
+    kept = np.asarray(safety["kept"])
+    samples = safety["samples"][kept].astype(float)  # [N, H, 2]
+    k, H = frame["k"], samples.shape[1]
+    fut = slice(k + 1, k + 1 + H)
+    b_pos, b_valid = scene["position"][b, fut].astype(float), scene["valid"][b, fut]
+    d_sat = cfg.get("d_sat")
+
+    def closest(traj):  # [M, H, 2] -> D [M], argmin step [M]
+        d = np.linalg.norm(traj - b_pos, axis=-1)
+        d[:, ~b_valid] = np.inf
+        t_star = d.argmin(-1)
+        m = d.min(-1)
+        m[np.isinf(m)] = 0.0
+        return (np.minimum(m, d_sat) if d_sat is not None else m), t_star
+
+    d_sample, t_sample = closest(samples)
+    d_actual, t_actual = closest(scene["position"][agent, fut][None].astype(float))
+    c = d_sample - d_actual[0]
+    if len(c) == 1:
+        tail = np.ones(1, dtype=bool)
+    else:
+        tail = c >= np.quantile(c, cfg["cvar_alpha"])
+        if not tail.any():
+            tail = c == c.max()
+    return {"index": kept, "c": c, "tail": tail, "t_star": t_sample, "t_star_actual": int(t_actual[0]),
+            "beta": float(c[tail].mean()) if len(c) else 0.0}
+
+
+def courtesy_contributions(pair) -> np.ndarray:
+    """Each of the target's samples' term of beta_c: its share of the exact
+    KL's mean, or its P1 * log(P1 / P2) term of the Boltzmann KL."""
+    if pair["kind"] == "boltzmann":
+        lp1, lp2 = pair["log_p_with"].astype(float), pair["log_p_without"].astype(float)
+        return np.exp(lp1) * (lp1 - lp2)
+    per = pair["per_sample"].astype(float)
+    return per / len(per)
+
+
+def other_ooi(record) -> List[int]:
+    """The objects of interest other than the queried agent; for records
+    written before the snapshot kept them, its most frequent neighbour."""
+    scene, agent = record["scene"], record["agent"]
+    if "is_ooi" in scene:
+        return [int(i) for i in np.flatnonzero(scene["is_ooi"]) if i != agent]
+    counts: Dict[int, int] = {}
+    for f in record["frames"]:
+        for b in f["neighbours"]:
+            counts[b] = counts.get(b, 0) + 1
+    return [max(counts, key=counts.get)] if counts else []
+
+
+def draw_dots(ax, traj, colour, zorder, size=9):
+    """Markers every 0.5 s along ``traj`` (which starts at the current pose),
+    so co-temporal positions of two trajectories can be matched by eye."""
+    pts = traj[STEP_DOTS::STEP_DOTS]
+    if len(pts):
+        ax.scatter(*pts.T, s=size, color=colour, edgecolors="white", linewidths=0.4, zorder=zorder)
+
+
+def draw_now(ax, scene, i, k, colour):
+    """Agent i's position at k as a dot (the contribution panels show where
+    the agents are, not their footprints)."""
+    ax.scatter(*scene["position"][i, k], s=60, color=colour, edgecolors="black", linewidths=0.8, zorder=7)
+
+
+def zoom(ax, pts, lo=12.0, hi=60.0):
+    pts = np.concatenate([p.reshape(-1, 2) for p in pts if len(p)])
+    mn, mx = pts.min(0), pts.max(0)
+    centre, r = (mn + mx) / 2, float(np.clip((mx - mn).max() / 2 + 4.0, lo, hi))
+    ax.set_xlim(centre[0] - r, centre[0] + r)
+    ax.set_ylim(centre[1] - r, centre[1] + r)
+    ax.set_aspect("equal")
+    ax.set_facecolor("#fbfbfb")
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+
+def blank(ax, text):
+    ax.text(0.5, 0.5, text, ha="center", va="center", transform=ax.transAxes, fontsize=8)
+    ax.axis("off")
+
+
+def draw_safety_top(ax, scene, agent, frame, groups, cfg, top_k) -> Optional[Dict]:
+    """The queried agent's samples that contribute most to beta_s, against
+    the neighbour's logged trajectory, with each one's closest approach."""
+    if not frame["per_neighbour"] or frame["safety"] is None:
+        blank(ax, "beta_s: no neighbour")
+        return None
+    b = max(frame["per_neighbour"], key=lambda n: frame["per_neighbour"][n][0])
+    con = safety_contributions(scene, agent, frame, b, cfg)
+    k = frame["k"]
+    H = frame["safety"]["samples"].shape[1]
+    order = np.argsort(-con["c"])[:top_k]
+    samples = from_now(scene, agent, k, frame["safety"]["samples"][con["index"][order]])
+    a_gt, b_gt = logged_future(scene, agent, k, H), logged_future(scene, b, k, H)
+    draw_map(ax, groups, 0.8)
+    ax.plot(*b_gt.T, color=NEIGHBOUR_COLOR, lw=2.0, ls="--", zorder=4)
+    draw_dots(ax, b_gt, NEIGHBOUR_COLOR, 4.5)
+    ax.plot(*a_gt.T, color="black", lw=1.6, ls="--", zorder=4)
+    draw_dots(ax, a_gt, "black", 4.5)
+    b_full = scene["position"][b, k + 1 : k + 1 + H]
+    handles = [plt.Line2D([], [], color="black", ls="--", lw=1.5, label="agent, logged"),
+               plt.Line2D([], [], color=NEIGHBOUR_COLOR, ls="--", lw=2.0, label=f"#{b}, logged")]
+    for rank, j in enumerate(order):
+        colour = TOP_COLORS[rank % len(TOP_COLORS)]
+        ax.plot(*samples[rank].T, color=colour, lw=1.6, alpha=0.9, zorder=5)
+        draw_dots(ax, samples[rank], colour, 5.5)
+        t = con["t_star"][j]
+        ax.plot([samples[rank][t + 1, 0], b_full[t, 0]], [samples[rank][t + 1, 1], b_full[t, 1]],
+                color=colour, lw=0.7, ls=":", zorder=5)
+        handles.append(plt.Line2D([], [], color=colour, lw=1.6,
+                                  label=f"C = {con['c'][j]:+.2f} m @ {(t + 1) / 10:.1f} s"
+                                        + ("" if con["tail"][j] else " (not in tail)")))
+    t = con["t_star_actual"]
+    ax.plot([a_gt[min(t + 1, len(a_gt) - 1), 0], b_full[t, 0]], [a_gt[min(t + 1, len(a_gt) - 1), 1], b_full[t, 1]],
+            color="black", lw=0.7, ls=":", zorder=5)
+    draw_now(ax, scene, agent, k, AGENT_COLOR)
+    draw_now(ax, scene, b, k, NEIGHBOUR_COLOR)
+    zoom(ax, [samples, a_gt, b_gt])
+    ax.legend(handles=handles, loc="upper left", fontsize=5.5, framealpha=0.85)
+    ax.set_title(f"beta_s toward #{b} = {frame['per_neighbour'][b][0]:+.2f} m\n"
+                 f"agent's top {len(order)} samples, C = D(sample) - D(logged)\n"
+                 f"{int(con['tail'].sum())}/{len(con['c'])} in the CVaR tail; dotted: closest approach",
+                 fontsize=7)
+    return {"b": b, **con, "order": order}
+
+
+def draw_courtesy_top(ax, scene, agent, frame, groups, top_k):
+    """The target's samples that contribute most to beta_c, against the
+    queried agent's logged trajectory."""
+    c_id, value = worst(frame, 1)
+    if c_id is None or c_id not in frame["courtesy"]:
+        blank(ax, "beta_c = 0: nothing contributes")
+        return
+    pair = frame["courtesy"][c_id]
+    k, H = frame["k"], pair["plans"].shape[1]
+    contrib = courtesy_contributions(pair)
+    order = np.argsort(-contrib)[:top_k]
+    plans = from_now(scene, c_id, k, pair["plans"][order])
+    a_gt, b_gt = logged_future(scene, agent, k, H), logged_future(scene, c_id, k, H)
+    draw_map(ax, groups, 0.8)
+    ax.plot(*a_gt.T, color=AGENT_COLOR, lw=2.0, ls="--", zorder=4)
+    draw_dots(ax, a_gt, AGENT_COLOR, 4.5)
+    ax.plot(*b_gt.T, color="black", lw=1.6, ls="--", zorder=4)
+    draw_dots(ax, b_gt, "black", 4.5)
+    handles = [plt.Line2D([], [], color=AGENT_COLOR, ls="--", lw=2.0, label="agent, logged"),
+               plt.Line2D([], [], color="black", ls="--", lw=1.5, label=f"#{c_id}, logged")]
+    unit = "nats"
+    for rank, j in enumerate(order):
+        colour = TOP_COLORS[(rank + 1) % len(TOP_COLORS)]
+        ax.plot(*plans[rank].T, color=colour, lw=1.6, alpha=0.9, zorder=5)
+        draw_dots(ax, plans[rank], colour, 5.5)
+        handles.append(plt.Line2D([], [], color=colour, lw=1.6,
+                                  label=f"{contrib[j]:+.3f} {unit} ({contrib[j] / max(value, 1e-9):.0%})"))
+    draw_now(ax, scene, agent, k, AGENT_COLOR)
+    draw_now(ax, scene, c_id, k, NEIGHBOUR_COLOR)
+    zoom(ax, [plans, a_gt, b_gt])
+    ax.legend(handles=handles, loc="upper left", fontsize=5.5, framealpha=0.85)
+    kind = "exact KL term / M" if pair["kind"] == "exact" else "P1 log(P1/P2)"
+    ax.set_title(f"beta_c toward #{c_id} = {value:.3f} nats\n"
+                 f"#{c_id}'s top {len(order)} samples vs the agent's log\n"
+                 f"contribution = {kind} (share of beta_c)", fontsize=7)
+
+
+def draw_speed(ax, scene, agent, others, frame, safety_top):
+    """Logged speed of the queried agent (red) and the other objects of
+    interest (blue) over the clip; within the horizon, the speed of the
+    agent's motion set, its top beta_s contributors highlighted."""
+    t = np.arange(scene["valid"].shape[1]) / 10
+    k = frame["k"]
+    for i, colour, label in [(agent, AGENT_COLOR, f"#{agent} (queried)")] + [
+            (o, NEIGHBOUR_COLOR, f"#{o} (other OOI)") for o in others]:
+        v = np.linalg.norm(scene["velocity"][i], axis=-1).astype(float)
+        v[~scene["valid"][i]] = np.nan
+        ax.plot(t, v, color=colour, lw=1.6, label=label, zorder=3)
+        if scene["valid"][i, k]:
+            ax.plot(t[k], v[k], "o", color=colour, ms=5, zorder=4)
+    safety = frame["safety"]
+    if safety is not None:
+        H = safety["samples"].shape[1]
+        traj = from_now(scene, agent, k, safety["samples"]).astype(float)
+        speed = np.linalg.norm(np.diff(traj, axis=1), axis=-1) / 0.1  # [N, H]
+        th = t[k + 1 : k + 1 + H]
+        for s in speed[safety["kept"]]:
+            ax.plot(th, s, color=AGENT_COLOR, lw=0.5, alpha=0.18, zorder=2)
+        if safety_top is not None:
+            for rank, j in enumerate(safety_top["order"]):
+                ax.plot(th, speed[safety_top["index"][j]], color=TOP_COLORS[rank % len(TOP_COLORS)],
+                        lw=1.0, ls="-", alpha=0.9, zorder=2.5)
+        ax.axvspan(t[k], t[min(k + H, len(t) - 1)], color="#999999", alpha=0.12, lw=0)
+    ax.axvline(t[k], color="black", lw=0.8)
+    ax.set_xlim(t[0], t[-1])
+    ax.set_ylim(bottom=0)
+    ax.set_xlabel("time [s]", fontsize=7)
+    ax.set_ylabel("speed [m/s]", fontsize=7)
+    ax.tick_params(labelsize=6.5)
+    ax.grid(alpha=0.3)
+    ax.legend(handles=ax.get_legend_handles_labels()[0]
+              + [plt.Line2D([], [], color=AGENT_COLOR, lw=0.8, alpha=0.4, label="motion set (horizon, shaded)")],
+              fontsize=6, loc="upper left", framealpha=0.85)
+    ax.set_title("speed profiles, logged (dots on trajectories: every 0.5 s)\n"
+                 "within the horizon: motion set, top beta_s samples in their colours", fontsize=7)
+
+
 def levels_of(frames, hmm_path) -> Dict[int, int]:
     """k -> filtered level (Eq. 6) of the clip's own beta sequence."""
     if hmm_path is None or not frames:
@@ -547,18 +860,22 @@ def draw_timeline(ax, frames, n, levels):
     ax.grid(alpha=0.3)
 
 
-def render(record, n, groups, radius, levels):
+def render(record, n, groups, radius, levels, top_k=5):
     scene, agent, frames, cfg = record["scene"], record["agent"], record["frames"], record["config"]
     frame = frames[n]
     k = frame["k"]
     horizon = horizon_of(frame, cfg["metric_horizon"])
-    fig = plt.figure(figsize=(12, 8.2), dpi=100)
-    grid = fig.add_gridspec(2, 3, width_ratios=[2.2, 1.2, 1.2], height_ratios=[3, 1.2], hspace=0.28, wspace=0.3)
+    fig = plt.figure(figsize=(13, 12.5), dpi=100)
+    grid = fig.add_gridspec(3, 3, width_ratios=[2.2, 1.2, 1.2], height_ratios=[3, 2.3, 1.1], hspace=0.32, wspace=0.3)
     ax_scene = fig.add_subplot(grid[0, 0])
     draw_scene(ax_scene, scene, agent, frame, groups, radius, horizon)
     draw_courtesy((fig.add_subplot(grid[0, 1]), fig.add_subplot(grid[0, 2])), scene, agent, frame, groups,
                   radius, horizon, cfg)
-    draw_timeline(fig.add_subplot(grid[1, :]), frames, n, levels)
+    row = grid[1, :].subgridspec(1, 3, wspace=0.25, width_ratios=[1, 1, 1.25])
+    safety_top = draw_safety_top(fig.add_subplot(row[0, 0]), scene, agent, frame, groups, cfg, top_k)
+    draw_courtesy_top(fig.add_subplot(row[0, 1]), scene, agent, frame, groups, top_k)
+    draw_speed(fig.add_subplot(row[0, 2]), scene, agent, other_ooi(record), frame, safety_top)
+    draw_timeline(fig.add_subplot(grid[2, :]), frames, n, levels)
     s_id, _ = worst(frame, 0)
     c_id, _ = worst(frame, 1)
     speed = float(np.linalg.norm(scene["velocity"][agent, k]))
@@ -577,7 +894,7 @@ def render(record, n, groups, radius, levels):
     return image
 
 
-def render_record(record, out_dir: Path, hmm_path=None, view_radius=None, fps=2.0):
+def render_record(record, out_dir: Path, hmm_path=None, view_radius=None, fps=2.0, top_k=5):
     """Renders every frame of a record to ``out_dir``/frames and stitches
     them into responsibility.gif (and .mp4 with OpenCV)."""
     frames = record["frames"]
@@ -590,7 +907,7 @@ def render_record(record, out_dir: Path, hmm_path=None, view_radius=None, fps=2.
     (out_dir / "frames").mkdir(parents=True, exist_ok=True)
     images = []
     for n, frame in enumerate(frames):
-        image = render(record, n, groups, radius, levels)
+        image = render(record, n, groups, radius, levels, top_k)
         plt.imsave(out_dir / "frames" / f"k_{frame['k']:03d}.png", image)
         images.append(image)
     gif, mp4 = write_video(images, out_dir, fps, stem="responsibility")
@@ -619,12 +936,14 @@ def main():
     for name, record in jobs:
         out = root / name if several else root
         out.mkdir(parents=True, exist_ok=True)
+        if args.raw_scenes and "signals" not in record["scene"]:
+            record["scene"]["signals"] = load_signals(args.raw_scenes, record)
         if not args.record:
             atomic_pickle(record, out / "record.pkl")
         if not record["frames"]:
             print(f"{name}: no window queried agent #{record['agent']}; nothing to render", flush=True)
             continue
-        gif, mp4, radius = render_record(record, out, args.hmm, args.view_radius, args.fps)
+        gif, mp4, radius = render_record(record, out, args.hmm, args.view_radius, args.fps, args.top_k)
         print(f"{name}: {len(record['frames'])} frames in {out / 'frames'} (view half-width {radius:.0f} m), "
               f"{gif}" + (f", {mp4[0]}" if mp4 else " (no OpenCV: GIF only)"), flush=True)
 
