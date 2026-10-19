@@ -197,10 +197,10 @@ def render_frame(frame, map_segments, view_radius, title, timeline):
     return image
 
 
-def write_video(frames, out_dir: Path, fps: float):
+def write_video(frames, out_dir: Path, fps: float, stem: str = "motion_sets"):
     from PIL import Image
 
-    gif_path = out_dir / "motion_sets.gif"
+    gif_path = out_dir / f"{stem}.gif"
     pil = [Image.fromarray(f) for f in frames]
     pil[0].save(gif_path, save_all=True, append_images=pil[1:], duration=int(1000 / fps), loop=0)
 
@@ -210,7 +210,7 @@ def write_video(frames, out_dir: Path, fps: float):
 
         h, w = frames[0].shape[:2]
         for codec in ("avc1", "mp4v"):
-            path = out_dir / "motion_sets.mp4"
+            path = out_dir / f"{stem}.mp4"
             writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*codec), fps, (w, h))
             if writer.isOpened():
                 for f in frames:

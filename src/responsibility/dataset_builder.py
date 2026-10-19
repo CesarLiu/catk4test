@@ -176,6 +176,7 @@ def compute_scenario_responsibility(
     steps: Optional[Sequence[int]] = None,
     agents: Optional[Sequence[int]] = None,
     stats: Optional[Dict[str, int]] = None,
+    details: Optional[Dict[Tuple[int, int], Dict]] = None,
 ) -> List[ResponsibilityObservation]:
     """Responsibility observations (Eq. 3/4/5) for every agent matching
     ``agent_type_filter`` (default 0 = vehicle, the paper's vehicle-vehicle
@@ -184,7 +185,10 @@ def compute_scenario_responsibility(
     ``steps`` defaults to the clip's native current step; pass the output
     of :func:`window_steps` to get a per-agent sequence instead. ``agents``
     restricts the query to those agent indices (still subject to being
-    observed at each step).
+    observed at each step). A ``details`` dict is filled with
+    ``(k, agent_idx) -> {"neighbours": [...], **samples}``, the samples each
+    observation was computed from (see ``responsibility_for_agents``'
+    ``keep_details``), in the clip's global frame.
     """
     # data comes from a batch_size=1 DataLoader, so PyG collates
     # "scenario_id" (a per-graph, non-tensor attribute) into a length-1 list.
@@ -204,7 +208,7 @@ def compute_scenario_responsibility(
         with shifted_context(data, k, cfg.num_historical_steps):
             observations.extend(
                 _responsibility_at_current_step(
-                    synthesizer, data, cfg, scenario_id, k, agent_type_filter, max_agents, agents, stats
+                    synthesizer, data, cfg, scenario_id, k, agent_type_filter, max_agents, agents, stats, details
                 )
             )
     return observations
@@ -220,6 +224,7 @@ def _responsibility_at_current_step(
     max_agents: Optional[int],
     agents: Optional[Sequence[int]] = None,
     stats: Optional[Dict[str, int]] = None,
+    details: Optional[Dict[Tuple[int, int], Dict]] = None,
 ) -> List[ResponsibilityObservation]:
     """``data`` must already be anchored so that ``cfg.num_historical_steps - 1``
     is the current step (see ``shifted_context``); ``k`` is only carried
@@ -269,7 +274,7 @@ def _responsibility_at_current_step(
     # one packed pass for every agent of this window (see ResponsibilityPlan)
     results, plan = responsibility_for_agents(
         synthesizer, data, tokenized_map, tokenized_agent, agents, neighbours_of, all_idx, cfg,
-        map_points=map_points,
+        map_points=map_points, keep_details=details is not None,
     )
     if stats is not None:
         stats["windows"] = stats.get("windows", 0) + 1
@@ -278,6 +283,8 @@ def _responsibility_at_current_step(
     observations = []
     for a in agents:
         r = results[a]
+        if details is not None:
+            details[(k, a)] = {"neighbours": list(neighbours_of[a]), **r["details"]}
         per_neighbour = {
             int(agent_id[b]): (float(r["safety"]["per_neighbor"].get(b, 0.0)),
                                float(r["courtesy"]["per_neighbor"].get(b, 0.0)))

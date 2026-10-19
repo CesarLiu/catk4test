@@ -90,3 +90,49 @@ def test_single_agent_wrapper_goes_through_the_planner(sampling_scheme):
 
     assert r["beta"].shape == (2,)
     assert set(r["safety"]["per_neighbor"]) == {1}
+
+
+def _details_pass(synth, data, cfg, keep_details, seed=0):
+    torch.manual_seed(seed)
+    tok_map, tok_agent = synth.tokenize(data)
+    results, _ = responsibility_for_agents(
+        synth, data, tok_map, tok_agent,
+        queried=[0, 1], neighbors_of={0: [1], 1: [0]},
+        all_agent_indices=[0, 1], cfg=cfg, keep_details=keep_details,
+    )
+    return results
+
+
+def test_details_are_the_samples_beta_was_computed_from(sampling_scheme):
+    from src.responsibility.metrics import _boltzmann_kl
+
+    data, cfg = _Data(n_agent=2), _cfg()
+    synth = MotionSetSynthesizer(FakeSMART(n_agent=2), sampling_scheme, rollout_batch_size=64)
+    plain = _details_pass(synth, data, cfg, keep_details=False)
+    detailed = _details_pass(synth, data, cfg, keep_details=True)
+
+    for a in (0, 1):
+        assert "details" not in plain[a]
+        # asking for the details does not change the numbers
+        assert torch.equal(plain[a]["beta"], detailed[a]["beta"])
+        d = detailed[a]["details"]
+        assert d["safety"]["samples"].shape[0] == cfg.n_safety_samples
+        assert d["safety"]["log_prob"].shape == (cfg.n_safety_samples,)
+        assert len(d["safety"]["kept"]) == cfg.n_safety_samples  # no filter configured
+        b = 1 - a
+        pair = d["courtesy"][b]
+        assert pair["kind"] == "boltzmann"
+        assert pair["plans"].shape[0] == 2 * cfg.n_courtesy_samples
+        assert torch.allclose(_boltzmann_kl(pair), detailed[a]["courtesy"]["per_neighbor"][b])
+
+
+def test_exact_details_average_to_beta_c(full_sampling_scheme):
+    data, cfg = _Data(n_agent=2), _cfg(courtesy_estimator="exact")
+    synth = MotionSetSynthesizer(FakeSMART(n_agent=2), full_sampling_scheme, rollout_batch_size=64)
+    detailed = _details_pass(synth, data, cfg, keep_details=True)
+
+    for a, b in ((0, 1), (1, 0)):
+        pair = detailed[a]["details"]["courtesy"][b]
+        assert pair["kind"] == "exact"
+        assert pair["plans"].shape[0] == pair["per_sample"].shape[0] == cfg.n_courtesy_samples
+        assert torch.allclose(pair["per_sample"].mean(), detailed[a]["courtesy"]["per_neighbor"][b])

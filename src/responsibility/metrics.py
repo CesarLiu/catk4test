@@ -27,6 +27,7 @@ from src.responsibility.motion_set import (
     RolloutJob,
     take_samples,
 )
+from src.responsibility.reward_model import mean_token_log_prob
 from src.responsibility.risk import cvar
 
 
@@ -317,7 +318,7 @@ def safety_from_rollouts(
         per_neighbor[int(b)] = safety_responsibility_pair(
             sampled_traj_a, gt_a.pos[0], gt_nb.pos[i], gt_nb.valid[i], cfg.cvar_alpha, d_sat=cfg.d_sat
         )
-    return {"per_neighbor": per_neighbor, "value": torch.stack(list(per_neighbor.values())).max()}
+    return {"per_neighbor": per_neighbor, "value": torch.stack(list(per_neighbor.values())).max(), "kept": keep}
 
 
 def _boltzmann_log_prob(reward: Tensor) -> Tensor:  # [N] -> [N]
@@ -385,11 +386,39 @@ def courtesy_from_rollouts(
     plausible options", not a change in the model's conditional
     distribution itself.
     """
-    zero = _zero(data)
+    terms = boltzmann_courtesy_terms(
+        with_rollouts, without_rollouts, data, query_idx, target_idx, all_agent_indices, cfg, map_points
+    )
+    return _zero(data) if terms is None else _boltzmann_kl(terms)
+
+
+def _boltzmann_kl(terms: Dict[str, Tensor]) -> Tensor:  # scalar, KL(P1 || P2)
+    log_p1, log_p2 = terms["log_p_with"], terms["log_p_without"]
+    return (log_p1.exp() * (log_p1 - log_p2)).sum().clamp(min=0.0)
+
+
+def boltzmann_courtesy_terms(
+    with_rollouts: Dict[str, Tensor],
+    without_rollouts: Dict[str, Tensor],
+    data,
+    query_idx: int,
+    target_idx: int,
+    all_agent_indices: Sequence[int],
+    cfg: ResponsibilityConfig,
+    map_points: Optional[Tensor] = None,
+) -> Optional[Dict[str, Tensor]]:
+    """The two Boltzmann distributions of :func:`courtesy_from_rollouts`
+    over b's pooled samples, or None where courtesy is zero by
+    construction:
+
+        plans          [2M, H, 2] b's pooled samples (with a, then without)
+        log_p_with     [2M] log P1, a's logged future in b's collision cost
+        log_p_without  [2M] log P2, a removed from it
+    """
     horizon = effective_horizon(data, cfg, with_rollouts["pred_traj_10hz"].shape[2])
     other_with = [i for i in all_agent_indices if i != target_idx]
     if horizon == 0 or len(other_with) == 0:
-        return zero
+        return None
     other_without = [i for i in other_with if i != query_idx]
 
     pooled = {
@@ -404,9 +433,11 @@ def courtesy_from_rollouts(
         else _empty_boxes(ego.pos, horizon)
     )
 
-    log_p1 = _boltzmann_log_prob(_reward_against_neighbors(ego, nb_with, map_points, cfg))
-    log_p2 = _boltzmann_log_prob(_reward_against_neighbors(ego, nb_without, map_points, cfg))
-    return (log_p1.exp() * (log_p1 - log_p2)).sum().clamp(min=0.0)
+    return {
+        "plans": ego.pos,
+        "log_p_with": _boltzmann_log_prob(_reward_against_neighbors(ego, nb_with, map_points, cfg)),
+        "log_p_without": _boltzmann_log_prob(_reward_against_neighbors(ego, nb_without, map_points, cfg)),
+    }
 
 
 def _check_exact_supported(cfg: "ResponsibilityConfig") -> None:
@@ -457,10 +488,20 @@ def exact_courtesy_from_logits(
     averaging over the sampled prefixes gives an unbiased estimate with
     lower variance than averaging whole-trajectory log-probability ratios.
     """
+    return exact_courtesy_per_sample(with_logits, without_logits, valid).mean()
+
+
+def exact_courtesy_per_sample(
+    with_logits: Tensor,  # [N, S, V]
+    without_logits: Tensor,  # [N, S, V]
+    valid: Tensor,  # [N, S]
+) -> Tensor:  # [N]
+    """Each sample's term of :func:`exact_courtesy_from_logits`: the summed
+    per-step KLs along that sample's prefix."""
     log_p = torch.log_softmax(with_logits, dim=-1)
     log_q = torch.log_softmax(without_logits, dim=-1)
     per_step = (log_p.exp() * (log_p - log_q)).sum(-1).clamp(min=0.0)  # [N, S]
-    return (per_step * valid.to(per_step.dtype)).sum(-1).mean()
+    return (per_step * valid.to(per_step.dtype)).sum(-1)
 
 
 def _replay_without(a: int, b: int, with_rollouts: Dict[str, Tensor]) -> RolloutJob:
@@ -546,10 +587,22 @@ def responsibility_for_agents(
     cfg: ResponsibilityConfig,
     map_points: Optional[Tensor] = None,
     sampling_scheme=None,
+    keep_details: bool = False,
 ) -> Tuple[Dict[int, Dict], ResponsibilityPlan]:
     """beta = [beta^safety, beta^courtesy] for every queried agent of one
     context window, with all the rollouts they need drawn in one packed
-    pass (see :class:`ResponsibilityPlan`)."""
+    pass (see :class:`ResponsibilityPlan`).
+
+    With ``keep_details`` each agent's entry also carries ``"details"``,
+    the samples its beta was computed from (for visualization):
+
+        safety    {"samples" [N, H, 2], "log_prob" [N] mean per-token log p,
+                   "kept" the samples the CVaR was taken over}
+        courtesy  {b: {"kind": "boltzmann", "plans" [2M, H, 2],
+                       "log_p_with" [2M], "log_p_without" [2M]}
+                   or {"kind": "exact", "plans" [M, H, 2],
+                       "per_sample" [M] each sample's summed per-step KL}}
+    """
     if cfg.courtesy_estimator not in COURTESY_ESTIMATORS:
         raise ValueError(f"courtesy_estimator must be one of {COURTESY_ESTIMATORS}")
     _check_exact_supported(cfg)
@@ -579,10 +632,17 @@ def responsibility_for_agents(
     out: Dict[int, Dict] = {}
     for a in queried:
         neighbours = [int(b) for b in neighbors_of.get(a, [])]
+        details = {"safety": None, "courtesy": {}}
         if a in plan.full_job and neighbours:
-            safety = safety_from_rollouts(
-                take_samples(results[plan.full_job[a]], cfg.n_safety_samples), data, a, neighbours, cfg
-            )
+            own = take_samples(results[plan.full_job[a]], cfg.n_safety_samples)
+            safety = safety_from_rollouts(own, data, a, neighbours, cfg)
+            if keep_details:
+                horizon = effective_horizon(data, cfg, own["pred_traj_10hz"].shape[2])
+                details["safety"] = {
+                    "samples": own["pred_traj_10hz"][:, 0, :horizon],
+                    "log_prob": mean_token_log_prob(own["token_log_prob"][:, 0], own["next_token_valid"][:, 0]),
+                    "kept": safety["kept"],
+                }
         else:
             safety = {"per_neighbor": {}, "value": zero}
 
@@ -590,26 +650,35 @@ def responsibility_for_agents(
         for b in plan.courtesy_targets.get(a, []):
             with_b = take_samples(results[plan.full_job[b]], cfg.n_courtesy_samples)
             if exact:
-                per_neighbor[b] = exact_courtesy_from_logits(
+                per_sample = exact_courtesy_per_sample(
                     with_b["next_token_logits"][:, 0],
                     replayed[(a, b)]["next_token_logits"][:, 0],
                     with_b["next_token_valid"][:, 0],
                 )
+                per_neighbor[b] = per_sample.mean()
+                if keep_details:
+                    horizon = effective_horizon(data, cfg, with_b["pred_traj_10hz"].shape[2])
+                    details["courtesy"][b] = {
+                        "kind": COURTESY_EXACT,
+                        "plans": with_b["pred_traj_10hz"][:, 0, :horizon],
+                        "per_sample": per_sample,
+                    }
             else:
-                per_neighbor[b] = courtesy_from_rollouts(
-                    with_b,
-                    results[plan.without_job[(a, b)]],
-                    data,
-                    a,
-                    b,
-                    all_agent_indices,
-                    cfg,
-                    map_points=map_points,
+                terms = boltzmann_courtesy_terms(
+                    with_b, results[plan.without_job[(a, b)]], data, a, b, all_agent_indices, cfg, map_points
                 )
+                if terms is not None:
+                    per_neighbor[b] = _boltzmann_kl(terms)
+                    if keep_details:
+                        details["courtesy"][b] = {"kind": COURTESY_BOLTZMANN, **terms}
         courtesy_value = torch.stack(list(per_neighbor.values())).max() if per_neighbor else zero
         courtesy = {"per_neighbor": per_neighbor, "value": courtesy_value}
         out[a] = {"beta": torch.stack([safety["value"], courtesy["value"]]), "safety": safety, "courtesy": courtesy}
+        if keep_details:
+            out[a]["details"] = details
     return out, plan
+
+
 
 
 # ---------------------------------------------------------------------------

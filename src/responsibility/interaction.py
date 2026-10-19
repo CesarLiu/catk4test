@@ -75,6 +75,9 @@ class InteractionConfig:
     # ... or, in influence mode, if its influence on the queried agent does
     influence_threshold: float = 0.02  # nats per step
     max_neighbors: Optional[int] = 8  # keep the strongest; None keeps all
+    # only WOMD objects of interest (role[:, 1]) can be neighbours, e.g. to
+    # measure the labelled interacting pair of the interactive split alone
+    ooi_only: bool = False
 
 
 def select_query_agents(
@@ -289,6 +292,8 @@ def select_interacting_neighbours(
     def prefilter(a: int, r: float) -> List[int]:
         dist = torch.linalg.norm(pos_now - pos_now[a], dim=-1)
         mask = (dist <= r) & observed & observed[a]
+        if cfg.ooi_only:
+            mask &= agent["role"][:, 1]
         mask[a] = False
         return mask.nonzero(as_tuple=True)[0].tolist()
 

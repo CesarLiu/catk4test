@@ -12,9 +12,9 @@ def _none_if_nonpositive(value):
     return value if value is not None and value > 0 else None
 
 
-def add_model_args(p: argparse.ArgumentParser) -> None:
+def add_model_args(p: argparse.ArgumentParser, ckpt_required: bool = True) -> None:
     g = p.add_argument_group("model")
-    g.add_argument("--ckpt", required=True, help="SMART .ckpt checkpoint.")
+    g.add_argument("--ckpt", required=ckpt_required, help="SMART .ckpt checkpoint.")
     g.add_argument("--model-config", default="smart", help="configs/model/<name>.yaml group.")
     g.add_argument("--device", default="auto", help="cuda, cpu, or auto (cuda if available).")
     g.add_argument("--rollout-batch-size", type=int, default=0,
@@ -80,6 +80,9 @@ def add_responsibility_args(p: argparse.ArgumentParser) -> None:
     g.add_argument("--ttc-threshold", type=float, default=i.ttc_threshold, help="s")
     g.add_argument("--influence-threshold", type=float, default=i.influence_threshold, help="nats per step")
     g.add_argument("--max-neighbors", type=int, default=i.max_neighbors, help="<=0 keeps all.")
+    g.add_argument("--ooi-neighbours", action="store_true",
+                   help="Only WOMD objects of interest can be neighbours (the selection rule above "
+                        "still applies among them).")
 
 
 def responsibility_config_from_args(args, num_historical_steps: int) -> ResponsibilityConfig:
@@ -110,6 +113,7 @@ def responsibility_config_from_args(args, num_historical_steps: int) -> Responsi
             ttc_threshold=args.ttc_threshold,
             influence_threshold=args.influence_threshold,
             max_neighbors=_none_if_nonpositive(args.max_neighbors),
+            ooi_only=args.ooi_neighbours,
         ),
     )
 

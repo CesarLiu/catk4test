@@ -122,6 +122,23 @@ def test_prefilter_radius_bounds_the_candidates():
     assert near.neighbours[0] == [] and far.neighbours[0] == [1]
 
 
+@pytest.mark.parametrize("mode", ["radius", "geometric"])
+def test_ooi_only_keeps_objects_of_interest(mode):
+    # 1 (stopped ahead) and 3 (crossing) interact, only 3 is an object of interest
+    roles = [[True, True, False], [False, False, False], [False, False, False], [False, True, False]]
+    data = _Data(
+        [[0, 0], [15, 0], [80, 0], [0, -15]],
+        [[10, 0], [0, 0], [0, 0], [0, 10]],
+        roles=roles,
+    )
+    every = select_interacting_neighbours(None, data, [0], NUM_HIST, HORIZON,
+                                          InteractionConfig(mode=mode), radius=30.0)
+    ooi = select_interacting_neighbours(None, data, [0], NUM_HIST, HORIZON,
+                                        InteractionConfig(mode=mode, ooi_only=True), radius=30.0)
+    assert set(every.neighbours[0]) == {1, 3}
+    assert ooi.neighbours[0] == [3]
+
+
 def test_query_modes():
     roles = [[True, False, False], [False, True, False], [False, False, True], [False, False, False]]
     data = _Data([[0, 0]] * 4, [[0, 0]] * 4, roles=roles, types=[0, 0, 1, 0])

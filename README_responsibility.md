@@ -123,6 +123,25 @@ python -m scripts.responsibility.visualize_motion_sets \
 # --agent-index / --neighbor-index pick a specific pair; --view-radius fixes the zoom
 ```
 
+The full responsibility of one agent, drawn from exactly the samples the
+pipeline scored: all its interacting neighbours (the one behind beta_s
+outlined red, behind beta_c blue), its motion set with the samples the CVaR
+left out greyed, the courtesy target's samples (Boltzmann: coloured by
+log P1/P2 next to P1 vs P2; exact: coloured by each sample's KL term), and
+beta_s / beta_c over the clip with the HMM level as background. It takes the
+same responsibility flags as `compute_responsibility.py` (or `--run DIR` to
+reuse a run's `config.json`) and saves a `record.pkl` that re-renders
+without the model:
+
+```bash
+python -m scripts.responsibility.visualize_responsibility \
+    --ckpt ckpts/clsft_E9.ckpt --data-root data/womd_cache/validation_interactive \
+    --scenario-index 0 1 --agent sdc adv --query sdc --courtesy-estimator exact \
+    --hmm logs/responsibility/demo/hmm.pkl --out-dir logs/responsibility/videos
+python -m scripts.responsibility.visualize_responsibility \
+    --record logs/responsibility/videos/<scenario>_sdc/record.pkl --out-dir logs/responsibility/rerender
+```
+
 ## 5. Full runs
 
 ### 5.1 Pick the rollout batch size
