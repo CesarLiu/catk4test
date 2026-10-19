@@ -107,22 +107,27 @@ used by this repo's `WOSACMetrics`.
   4.8x2.0 m vehicle would get r=2.4 m, so two cars in adjacent lanes
   (~3.5 m apart) would register a permanent collision, lighting up both
   the courtesy KL and the IRL collision feature during ordinary driving.
-- **D_g saturates at `d_sat` (default 10 m).** The paper leaves it
+- **D_g saturates at `d_sat` (default 20 m, centre distance).** The paper leaves it
   unsaturated, but reports a safety axis topping out near 1.2 m with
   almost all mass at zero, which an unsaturated min-distance difference
   cannot produce: against a distant neighbor any alternative motion
   "gains" metres for free. Saturating at an interaction range keeps the
   metric about interaction; pass `--d-sat 0` for the literal definition.
+  The default was 10 m, which (being a ~5 m gap) forced beta_s <= 0 on
+  every pair whose logged closest approach exceeded it -- 42% of the
+  interacting pairs in the interactive split; at 20 m beta_s there is
+  within 1% of the unsaturated value.
   `neighbor_radius` defaults to 30 m (the paper states none) for the same
   reason.
 - **Responsibility is measured over a fixed `metric_horizon`** (default 20
   steps = 2 s, the paper's own prediction horizon) rather than SMART's
   full 8 s rollout, so beta stays comparable across context times.
-- **Courtesy rollouts are skipped for pairs more than
-  `courtesy_skip_distance` apart**, where the Boltzmann KL is provably
-  zero (the two rewards differ only in the collision term against the
-  queried agent). This is a compute shortcut with no effect on the
-  non-zero values; set it to `0` to disable.
+- **Courtesy rollouts can be skipped for pairs more than
+  `courtesy_skip_distance` apart** (off by default). For the Boltzmann
+  estimator the KL there is provably zero (the two rewards differ only in
+  the collision term against the queried agent), so `20` is a pure compute
+  shortcut; the exact KL does not decay by 15-20 m, so for it the skip
+  drops real values.
 - **Courtesy has two estimators** (`--courtesy-estimator`). `boltzmann` is
   the paper's Sec. V-B proxy (Eq. 7): b's motions are reweighted by a
   hand-made reward with and without a, so it is zero unless b's samples
@@ -255,8 +260,8 @@ tractable, all on by default:
 - **Truncated rollouts.** Only `metric_horizon` steps are ever scored, and
   an autoregressive rollout stopped early is exactly the prefix of a full
   one, so the metric paths roll out 2 s instead of 8 s.
-- **Skipped courtesy pairs.** Pairs further apart than
-  `courtesy_skip_distance` have a provably zero Boltzmann KL and are
+- **Skipped courtesy pairs** (`--courtesy-skip-distance 20`, Boltzmann
+  only). Pairs further apart have a provably zero Boltzmann KL and are
   skipped before any rollout.
 
 Start with `--max-scenarios` on a small slice and check that the

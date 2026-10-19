@@ -44,7 +44,8 @@ def add_responsibility_args(p: argparse.ArgumentParser) -> None:
                         "motions collide with the queried agent; exact: the model's own KL (Eq. 4) "
                         "via the chain rule over replayed samples.")
     g.add_argument("--courtesy-skip-distance", type=float, default=d.courtesy_skip_distance,
-                   help="Skip courtesy rollouts for pairs further apart (m); <=0 disables.")
+                   help="Skip courtesy rollouts for pairs further apart (m); <=0 or unset disables "
+                        "(the default; 20 is exact for the boltzmann estimator, lossy for exact).")
     g.add_argument("--others-future", default=d.others_future, choices=OTHERS_FUTURES,
                    help="Future of the other agents when featurising trajectories for the reward "
                         "networks: constant_velocity (causal; use for prediction) or logged "

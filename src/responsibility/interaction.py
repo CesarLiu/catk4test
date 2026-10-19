@@ -64,7 +64,7 @@ class InteractionConfig:
     # since the real filtering happens on the interaction evidence below
     prefilter_radius: float = 50.0
     # a candidate interacts if ANY of the geometric criteria fires ...
-    gap_threshold: float = 10.0  # m, footprint gap; matches the default d_sat
+    gap_threshold: float = 10.0  # m, footprint gap (~15 m centre distance)
     # For a car-following pair PET *is* the time headway, so this doubles as
     # the two-second rule; for crossings, ~2 s is a common potential-conflict
     # threshold. At 3 s a follower cruising 30 m behind at 10 m/s would count.

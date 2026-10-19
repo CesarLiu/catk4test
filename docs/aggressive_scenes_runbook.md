@@ -12,7 +12,8 @@
 - **场景编号就是文件名。** `womd_500_cache/<N>.pkl` 和 catspond 的 `raw_scenes_500/<N>.pkl` 是同一个场景：500 个文件的 SDC id 和 OOI id 都已逐一核对一致。数据集内部按文件名的字典序排序（`0, 1, 10, 100, …`），所以下面的命令用 `--scenario-file` 按文件名选场景，而不是用 `--scenario-index`。
 - **只看 OOI**（`--ooi-neighbours`）。这 47 个场景都恰好有 2 个 OOI，两个都是 vehicle，其中一个是 SDC。因此 adv 唯一可能的邻居是 SDC，SDC 唯一可能的邻居是 adv。
 - 在 OOI 之间仍然按默认的 geometric 规则（gap / PET / TTC）筛选邻居。所以两车在某个 window 里没有交互时，β 就是 0，这是如实的结果。如果想让这对 agent 在每个 window 都参与计算，可以加 `--neighbor-selection radius --neighbor-radius 200`。
-- 其他设置都是 pipeline 的默认值：模型 `clsft_E9.ckpt`（CAT-K），horizon 2 s，每个 window 间隔 0.5 s，safety 采样 40 条，courtesy 采样 20 条。
+- 其他设置都是 pipeline 的默认值：模型 `clsft_E9.ckpt`（CAT-K），horizon 2 s，每个 window 间隔 0.5 s，safety 采样 40 条，courtesy 采样 20 条，`d_sat` = 20 m，不跳过 courtesy（`courtesy_skip_distance` 关闭）。
+- **默认值改动**：`d_sat` 从 10 m 改为 20 m，`courtesy_skip_distance` 从 20 m 改为关闭。D_g 是两车中心之间的距离，10 m 只相当于约 5 m 的车间距，会让实际最近距离超过 10 m 的对（这批场景里占 42%）的 β_s 被强制 ≤ 0。exact KL 到 15–20 m 时仍未衰减，所以不再跳过。在此之前跑出的 record 和 HMM 用的是旧默认值，不能和新结果直接比较。
 
 ## 1. 本机：推送代码、拷贝数据
 

@@ -55,8 +55,13 @@ class ResponsibilityConfig:
     # trivially, which swamps the metric with non-interactions.
     neighbor_radius: float = 30.0
     # Interaction range at which D_g saturates (see geometry.saturate). None
-    # reproduces the paper's literal, unsaturated definition.
-    d_sat: Optional[float] = 10.0
+    # reproduces the paper's literal, unsaturated definition. D_g is a centre
+    # distance, so 10 m (the earlier default) is only a ~5 m gap: it forced
+    # beta_s <= 0 on every pair whose logged closest approach exceeded it,
+    # 42% of the interacting pairs in the interactive split. At 20 m beta_s
+    # is within 1% of the unsaturated one there, since neighbour selection
+    # already drops the far pairs saturation guards against.
+    d_sat: Optional[float] = 20.0
     # Steps of future over which responsibility is measured. Fixing this
     # keeps beta comparable across context times k (see dataset_builder's
     # sliding windows), where the amount of remaining logged future varies.
@@ -96,9 +101,10 @@ class ResponsibilityConfig:
     courtesy_estimator: str = COURTESY_BOLTZMANN
     # Pairs further apart than this are skipped before rolling out. For the
     # Boltzmann proxy this is exact (its two rewards then coincide); for the
-    # exact estimator it is an approximation that drops weak far-field
-    # influence. None disables it.
-    courtesy_skip_distance: Optional[float] = 20.0
+    # exact estimator it drops real influence -- its KL does not decay by
+    # 15-20 m -- so it is off by default (None); 20 m is a safe compute
+    # shortcut for the Boltzmann proxy alone.
+    courtesy_skip_distance: Optional[float] = None
     # Where the other agents' futures come from when scoring trajectories
     # for the reward networks (their collision feature), in training and at
     # prediction time alike. "constant_velocity" extrapolates their current

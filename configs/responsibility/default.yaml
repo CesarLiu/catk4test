@@ -10,8 +10,9 @@ n_courtesy_samples: 20 # samples per with/without-agent condition (paper: 20 eac
 neighbor_radius: 30.0 # meters; the paper does not state one. Deliberately tighter than
 # SMART's own 60 m a2a_radius: past ~30 m an "alternative" gains
 # distance against a neighbour trivially and swamps the metric.
-d_sat: 10.0 # meters at which D_g saturates; null reproduces the paper's
-# literal unsaturated definition (see geometry.py::saturate)
+d_sat: 20.0 # meters (centre distance) at which D_g saturates; null reproduces the
+# paper's literal unsaturated definition (see geometry.py::saturate). 10 m forced
+# beta_s <= 0 on every pair whose logged closest approach exceeded it.
 metric_horizon: 20 # future steps @10Hz over which beta is measured (2 s, as in the
 # paper). Fixed so beta stays comparable across context times k.
 window_stride: 5 # spacing (10Hz steps) between the context steps swept within one
@@ -31,8 +32,8 @@ collision_weight: 10.0 # weight on collision cost in R = -10*c_coll - c_dev (Sec
 drivable_half_width: 3.0 # meters; road-deviation cost threshold (approximation, see
 # src/responsibility/geometry.py::road_deviation_cost and
 # scripts/responsibility/inspect_map_types.py)
-courtesy_skip_distance: 20.0 # skip the courtesy rollouts for pairs this far apart, where
-# the Boltzmann KL is provably 0; null disables the shortcut
+courtesy_skip_distance: null # skip the courtesy rollouts for pairs this far apart; exact
+# for the Boltzmann KL (20 m is safe there), lossy for the exact KL; null disables it
 
 # --- Sec. IV-A: HMM responsibility-level abstraction ---
 hmm_n_states_grid: [3, 5, 7, 9, 11] # paper sweeps these and picks lowest BIC
