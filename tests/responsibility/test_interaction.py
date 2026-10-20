@@ -152,6 +152,14 @@ def test_query_modes():
         select_query_agents(data, NOW, "ego")
 
 
+def test_adv_query_is_the_non_sdc_object_of_interest():
+    # interactive split: the SDC is one of the two objects of interest
+    roles = [[True, True, False], [False, True, False], [False, False, True]]
+    data = _Data([[0, 0]] * 3, [[0, 0]] * 3, roles=roles)
+    assert select_query_agents(data, NOW, "interest") == [0, 1, 2]
+    assert select_query_agents(data, NOW, "adv") == [1]
+
+
 def test_influence_matrix_shape_and_diagonal(sampling_scheme):
     synth = MotionSetSynthesizer(FakeSMART(n_agent=3), sampling_scheme, rollout_batch_size=16)
     data = _Data([[0, 0], [5, 0], [10, 0]], [[0, 0]] * 3)

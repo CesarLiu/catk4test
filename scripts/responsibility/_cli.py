@@ -66,7 +66,8 @@ def add_responsibility_args(p: argparse.ArgumentParser) -> None:
     g = p.add_argument_group("who is queried, and against whom")
     g.add_argument("--query", default=d.query_mode, choices=QUERY_MODES,
                    help="vehicles, sdc (the self-driving car), interest (WOMD objects of "
-                        "interest / tracks to predict) or all.")
+                        "interest / tracks to predict), adv (the objects of interest other than "
+                        "the SDC) or all.")
     g.add_argument("--direction", default=d.query_direction, choices=DIRECTIONS,
                    help="With --query sdc: outgoing (SDC toward others), incoming (others "
                         "toward the SDC) or both.")

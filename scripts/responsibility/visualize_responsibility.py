@@ -68,7 +68,7 @@ import argparse
 import json
 import pickle
 import sys
-from dataclasses import asdict, fields, replace
+from dataclasses import fields, replace
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
 
@@ -89,6 +89,7 @@ from scripts.responsibility._cli import (  # noqa: E402
     responsibility_config_from_args,
 )
 from scripts.responsibility.visualize_motion_sets import box_corners, write_video  # noqa: E402
+from src.responsibility.records import RECORD_VERSION, make_record, record_frames  # noqa: E402
 
 AGENT_COLOR = "#d62728"
 NEIGHBOUR_COLOR = "#1f77b4"
@@ -99,7 +100,6 @@ BOTH_COLOR = "#7b2d8e"
 # pt_token.pl_type: ["lane", "road_edge", "road_line", "crosswalk"] -> (colour, width)
 MAP_STYLE = {0: ("#dcdcdc", 0.8), 1: ("#505050", 1.0), 2: ("#b0b0b0", 0.6), 3: ("#c9b458", 0.8)}
 TYPE_NAME = {0: "veh", 1: "ped", 2: "cyc"}
-RECORD_VERSION = 1
 RUN_OVERRIDABLE = ("courtesy_estimator", "neighbor_future")  # flags that take precedence over --run
 
 
@@ -195,35 +195,6 @@ def pick_agent(data, which: str) -> int:
     return int(idx[0])
 
 
-def to_numpy(x):
-    import torch
-
-    if torch.is_tensor(x):
-        return x.detach().cpu().numpy()
-    if isinstance(x, dict):
-        return {k: to_numpy(v) for k, v in x.items()}
-    if isinstance(x, (list, tuple)):
-        return type(x)(to_numpy(v) for v in x)
-    return x
-
-
-def scene_snapshot(data) -> Dict:
-    agent = data["agent"]
-    return to_numpy({
-        "position": agent["position"][..., :2],
-        "heading": agent["heading"],
-        "velocity": agent["velocity"],
-        "valid": agent["valid_mask"],
-        "shape": agent["shape"],
-        "type": agent["type"],
-        "id": agent["id"],
-        "is_sdc": agent["role"][:, 0],
-        "is_ooi": agent["role"][:, 1],
-        "map_pos": data["map_save"]["traj_pos"],
-        "map_type": data["pt_token"]["pl_type"],
-    })
-
-
 def live_records(args) -> Iterator[Tuple[str, Dict]]:
     """(name, record) for every scenario and agent asked for."""
     import torch
@@ -267,36 +238,13 @@ def live_records(args) -> Iterator[Tuple[str, Dict]]:
                 synth, data, cfg, agent_type_filter=agent_type_from_args(args),
                 steps=window_steps(data, cfg, synth, cfg.window_stride), agents=[a], details=details,
             )
-            frames = []
-            for obs in observations:
-                if obs.agent_idx != a:
-                    continue
-                d = to_numpy(details[(obs.k, a)])
-                frames.append({
-                    "k": obs.k,
-                    "beta": obs.beta.numpy(),
-                    "neighbours": d["neighbours"],
-                    "per_neighbour": {b: obs.per_neighbour[int(data["agent"]["id"][b])] for b in d["neighbours"]},
-                    "interaction": {b: obs.interaction[int(data["agent"]["id"][b])] for b in d["neighbours"]},
-                    "safety": d["safety"],
-                    "courtesy": d["courtesy"],
-                })
-                s, c = frames[-1]["beta"]
-                print(f"{name} k={obs.k:3d}: safety {s:+.3f} m, courtesy {c:.4f} nats, "
-                      f"{len(d['neighbours'])} neighbour(s)", flush=True)
-            yield name, {
-                "version": RECORD_VERSION,
-                "scenario_id": scenario_id,
-                "scenario_index": index,
-                "scenario_file": files[index].stem,
-                "agent": a,
-                "agent_id": int(data["agent"]["id"][a]),
-                "config": asdict(cfg),
-                "sampling": sampling,
-                "ckpt": str(Path(args.ckpt).resolve()),
-                "scene": scene_snapshot(data),
-                "frames": frames,
-            }
+            frames = record_frames(data, observations, details, a)
+            for frame in frames:
+                s, c = frame["beta"]
+                print(f"{name} k={frame['k']:3d}: safety {s:+.3f} m, courtesy {c:.4f} nats, "
+                      f"{len(frame['neighbours'])} neighbour(s)", flush=True)
+            yield name, make_record(data, frames, cfg, sampling, str(Path(args.ckpt).resolve()),
+                                    scenario_id, index, files[index].stem, a)
 
 
 # ----------------------------------------------------------------------------

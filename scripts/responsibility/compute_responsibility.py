@@ -60,6 +60,10 @@ def parse_args():
                    help="Add to an --out-dir whose recorded configuration differs.")
     p.add_argument("--max-scenarios", type=int, default=None, help="Per shard.")
     p.add_argument("--max-agents-per-scenario", type=int, default=None)
+    p.add_argument("--keep-records", action="store_true",
+                   help="With --out-dir: also save every queried agent's windows with the samples they were "
+                        "scored from, as OUT_DIR/records/<scenario file>_<agent id>/record.pkl, for "
+                        "visualize_responsibility.py --record (about 0.1-0.4 MB each).")
     p.add_argument("--no-sweep-windows", action="store_true",
                    help="Evaluate only the clip's native current step (sequences of length 1).")
     add_model_args(p)
@@ -101,7 +105,7 @@ def main():
         totals = run_responsibility_to_dir(
             model, args.data_root, args.out_dir, rcfg, run_config, device=device,
             num_shards=args.num_shards, shard_index=args.shard_index,
-            allow_config_mismatch=args.allow_config_mismatch, **common,
+            allow_config_mismatch=args.allow_config_mismatch, keep_records=args.keep_records, **common,
         )
         print(f"shard {args.shard_index}/{args.num_shards} done: {totals}")
         return

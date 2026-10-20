@@ -24,6 +24,7 @@ from src.responsibility.dataset_builder import (
 from src.responsibility.hmm import GaussianHMM, ModelSelectionResult, fit_hmm_with_model_selection
 from src.responsibility.metrics import ResponsibilityConfig
 from src.responsibility.motion_set import MotionSetSynthesizer
+from src.responsibility.records import make_record, record_frames
 from src.responsibility.results_io import (  # noqa: F401  (re-exported for scripts)
     atomic_pickle,
     check_run_config,
@@ -296,12 +297,18 @@ def run_responsibility_to_dir(
     num_shards: int = 1,
     shard_index: int = 0,
     allow_config_mismatch: bool = False,
+    keep_records: bool = False,
     log=None,
 ) -> Dict[str, int]:
     """Stage 1 over a dataset, one result file per scenario under
     ``out_dir/obs/``. Scenarios that already have a result are skipped, so an
     interrupted run resumes where it stopped, and ``num_shards`` processes
-    with distinct ``shard_index`` can fill the same directory in parallel."""
+    with distinct ``shard_index`` can fill the same directory in parallel.
+
+    With ``keep_records``, every queried agent's windows are also saved as a
+    record (see :mod:`src.responsibility.records`) to
+    ``out_dir/records/<scenario file>_<agent id>/record.pkl``, which
+    visualize_responsibility.py --record renders without the model."""
     import time
 
     if log is None:  # unbuffered: this is usually redirected to a log file
@@ -330,13 +337,23 @@ def run_responsibility_to_dir(
     for n_done, (index, scenario_id, data) in enumerate(iter_scenarios(data_root, device, indices=todo), 1):
         t0 = time.perf_counter()
         stats: Dict[str, int] = {}
+        details = {} if keep_records else None
         steps = window_steps(data, cfg, synthesizer, cfg.window_stride) if sweep_windows else None
         obs = compute_scenario_responsibility(
             synthesizer, data, cfg, agent_type_filter=agent_type_filter,
-            max_agents=max_agents_per_scenario, steps=steps, stats=stats,
+            max_agents=max_agents_per_scenario, steps=steps, stats=stats, details=details,
         )
         for o in obs:
             o.scenario_id = scenario_id
+        if keep_records:  # before the observations, which mark the scenario done
+            for a in sorted({o.agent_idx for o in obs}):
+                frames = record_frames(data, obs, details, a)
+                if frames:
+                    record = make_record(data, frames, cfg, run_config.get("sampling", {}), run_config.get("ckpt", ""),
+                                         scenario_id, index, files[index].stem, a)
+                    record_dir = out / "records" / f"{files[index].stem}_{record['agent_id']}"
+                    record_dir.mkdir(parents=True, exist_ok=True)
+                    atomic_pickle(record, record_dir / "record.pkl")
         atomic_pickle(obs, out / "obs" / f"{files[index].stem}.pkl")
 
         dt = time.perf_counter() - t0

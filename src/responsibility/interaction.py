@@ -51,8 +51,9 @@ SELECTION_MODES = (SELECTION_RADIUS, SELECTION_GEOMETRIC, SELECTION_INFLUENCE)
 QUERY_VEHICLES = "vehicles"
 QUERY_SDC = "sdc"
 QUERY_INTEREST = "interest"
+QUERY_ADV = "adv"
 QUERY_ALL = "all"
-QUERY_MODES = (QUERY_VEHICLES, QUERY_SDC, QUERY_INTEREST, QUERY_ALL)
+QUERY_MODES = (QUERY_VEHICLES, QUERY_SDC, QUERY_INTEREST, QUERY_ADV, QUERY_ALL)
 
 DT = 0.1  # seconds per 10Hz step
 
@@ -89,7 +90,8 @@ def select_query_agents(
     """Agents whose responsibility is evaluated, among those observed at
     ``at_step``: every vehicle (``agent_type``), only the self-driving car
     (WOMD ``role[:, 0]``), the objects of interest / tracks to predict
-    (``role[:, 1:]``), or everyone."""
+    (``role[:, 1:]``), the objects of interest other than the SDC (``adv``:
+    in the interactive split, the SDC's labelled counterpart), or everyone."""
     if mode not in QUERY_MODES:
         raise ValueError(f"query mode must be one of {QUERY_MODES}, got {mode!r}")
     agent = data["agent"]
@@ -98,6 +100,8 @@ def select_query_agents(
         mask = agent["role"][:, 0] & observed
     elif mode == QUERY_INTEREST:
         mask = agent["role"][:, 1:].any(-1) & observed
+    elif mode == QUERY_ADV:
+        mask = agent["role"][:, 1] & ~agent["role"][:, 0] & observed
     else:
         mask = observed.clone()
         if mode == QUERY_VEHICLES and agent_type is not None:
