@@ -1,0 +1,23 @@
+[
+  {"query": "我在 cat/raw_scenes_500 里有 500 个 WOMD 场景的 pkl，帮我判断每个场景里 SDC 对另一个 OOI 是不是激进驾驶，按美国加州交通法规来，输出一个 csv，每个场景一行加理由", "should_trigger": true},
+  {"query": "scene 137 里两辆车都在 all-way stop 等着，SDC 左转先走了，OOI 在它右边。这算不算 SDC aggressive？按 CVC 判断一下，别只看谁刹车了", "should_trigger": true},
+  {"query": "i have human labels saying the SDC is aggressive in scenes 76 197 207 318 431 of our waymo motion scenes. can you check if those hold up under traffic law (who had right of way at the stop sign) or if the labels are just wrong", "should_trigger": true},
+  {"query": "our nuPlan singapore logs are left-hand traffic so the california right-of-way rules wont work. can you adapt the aggressive driving criteria for left-hand roads and then label which ego cars cut in on other agents", "should_trigger": true},
+  {"query": "who had the right of way at the intersection in this scenario pkl? did the sdc jump the queue at the all-way stop before the other car that arrived first", "should_trigger": true},
+  {"query": "把评判标准改成中国的路权规则（转弯让直行、右转让左转），然后对 /data/scenes 下这批场景重新打一遍 aggressive 标签，需要的话新加一个规则档", "should_trigger": true},
+  {"query": "label tailgating and cut-ins by the ego in /data/womd_scenes/*.pkl — one csv row per scene with a one sentence reason and confidence, only judge the sdc toward the other object of interest", "should_trigger": true},
+  {"query": "ooi_labels 里 Claude 标的结果有问题，crossing 场景全没识别出来，只标了 cut-in。帮我看看为什么漏标了这些 sdc 抢行的场景，规则该怎么改", "should_trigger": true},
+  {"query": "Is the ego being aggressive toward the other agent of interest in this Waymo scene? both are turning left at an unsignalized intersection and the SDC went first even though the other one was already waiting", "should_trigger": true},
+  {"query": "add a germany profile (rechts vor links, StVO 8) so the aggression screening works on our munich scenes, and tell me which of the 500 scenes it would flag differently from the california one", "should_trigger": true},
+
+  {"query": "compute the counterfactual responsibility metrics beta_s and beta_c for each window in raw_scenes_500 using the DenseTNT model and write windows.csv, I just need the numbers not any verdict", "should_trigger": false},
+  {"query": "convert the womd v1.2.1 tfrecord shards in ~/womd_v1_2_1 into scenarionet pkl files with the CAT converter, 500 scenes is enough, and make index.csv", "should_trigger": false},
+  {"query": "can you explain CVC 21800 and 21801 to me, I'm studying for the california driving test and keep mixing up who yields at a four-way stop. no scenes involved, just the rules", "should_trigger": false},
+  {"query": "train the SMART motion prediction model on the WOMD training split for 20 epochs on the H200 and log minADE and miss rate every epoch", "should_trigger": false},
+  {"query": "plot the distribution of time headways between all vehicle pairs in the 500 scenes as a histogram, i just want the stats, don't judge anyone", "should_trigger": false},
+  {"query": "render a 10 hz bev video of scene 282 with the sdc in blue and the ooi in orange, stop signs marked, so I can show it in tomorrow's meeting", "should_trigger": false},
+  {"query": "my TD3 policy crashes in 30% of the metadrive episodes with the CAT adversary, help me debug the reward and tell me which weights to change to get the collision rate down", "should_trigger": false},
+  {"query": "write a pytest for the lane graph builder in responsibility/lanes.py that checks the exits of a T junction, the test should run without any scene files", "should_trigger": false},
+  {"query": "I'm writing the status slides for my boss on our aggressive driving classification project. Summarize the ML track (counterfactual responsibility vs rule-based) in 5 bullets, no new numbers", "should_trigger": false},
+  {"query": "a pedestrian crossing at a crosswalk in this scene: write code that finds the first frame where the pedestrian enters the crosswalk polygon and the min distance to the nearest car", "should_trigger": false}
+]

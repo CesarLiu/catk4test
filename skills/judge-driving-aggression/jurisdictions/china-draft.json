@@ -1,0 +1,18 @@
+{
+  "id": "china-draft",
+  "name": "China, Regulations for the Implementation of the Road Traffic Safety Law, article 51 (right-hand traffic)",
+  "status": "draft: written from the regulation as I recall it, not checked against the current text and not validated on any data. Confirm with a local traffic-law expert before using results.",
+  "driving_side": "right",
+  "all_way_stop": {
+    "first_arrival": false,
+    "unknown_order": "tie",
+    "tie_rules": ["turner_yields_straight", "oncoming_right_yields_left", "yield_right"]
+  },
+  "uncontrolled_rules": ["turner_yields_straight", "oncoming_right_yields_left", "yield_right"],
+  "t_junction": "ending_road_yields",
+  "notes": [
+    "Where signs or markings control the junction the vehicle with priority goes first.",
+    "Without them: stop and look, yield to the vehicle on the right-hand road, a turning vehicle yields to one going straight, and an oncoming right turner yields to a left turner.",
+    "All-way stops with an arrival order are not a Chinese convention, so first_arrival is false here."
+  ]
+}

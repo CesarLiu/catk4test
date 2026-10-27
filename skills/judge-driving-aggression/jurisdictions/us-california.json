@@ -1,0 +1,21 @@
+{
+  "id": "us-california",
+  "name": "United States, California Vehicle Code (right-hand traffic)",
+  "status": "validated: used to label CAT's 500 WOMD scenes; 3 SDC events agree with human labels, 7 human labels judged not violations (see references/validation-us-california.md)",
+  "driving_side": "right",
+  "all_way_stop": {
+    "first_arrival": true,
+    "unknown_order": "tie",
+    "tie_rules": ["oncoming_left_yields", "yield_right"]
+  },
+  "uncontrolled_rules": ["oncoming_left_yields"],
+  "t_junction": "ending_road_yields",
+  "notes": [
+    "21800(a): at an all-way stop the first vehicle to arrive and stop goes first.",
+    "21800(b), 21801(a): on a tie, or when both were already waiting at the start of the clip, a left turn yields to oncoming traffic, otherwise the vehicle on the left yields to the one on the right.",
+    "21802: at a two-way stop the vehicle at the sign yields to cross traffic.",
+    "21800(c): at a T junction without control the road that ends yields.",
+    "Uncontrolled junctions: only the left-turn rule is applied. First-entered and yield-right were tried and held for no more than chance on the 500 scenes, because the map usually lacks the signs or lights that really control such a junction.",
+    "A complete stop is required by law but is not used to label aggression: the clip starts mid-approach, so a stop before step 0 cannot be seen."
+  ]
+}

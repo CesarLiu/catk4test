@@ -1,0 +1,17 @@
+{
+  "id": "left-hand-draft",
+  "name": "Left-hand traffic: the California structure reflected (a placeholder, not any country's law)",
+  "status": "draft: mirror image of us-california so that the machinery works on left-hand roads; no country's statute has been checked. Replace the rules with the local ones before using results.",
+  "driving_side": "left",
+  "all_way_stop": {
+    "first_arrival": true,
+    "unknown_order": "tie",
+    "tie_rules": ["oncoming_right_yields", "yield_left"]
+  },
+  "uncontrolled_rules": ["oncoming_right_yields"],
+  "t_junction": "ending_road_yields",
+  "notes": [
+    "A right turn crosses the oncoming lane in left-hand traffic and yields to it; the vehicle on the right yields to the one on the left.",
+    "Many left-hand countries (UK, Japan, Australia) do not use all-way stops and give priority by sign, marking or roundabout rules. Edit all_way_stop and add rules before relying on this profile."
+  ]
+}

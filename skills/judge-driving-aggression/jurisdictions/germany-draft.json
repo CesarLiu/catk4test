@@ -1,0 +1,18 @@
+{
+  "id": "germany-draft",
+  "name": "Germany, StVO sections 8 and 9 (right-hand traffic)",
+  "status": "draft: written from the statute as I recall it, not checked against the current text and not validated on any data. Confirm with a local traffic-law expert before using results.",
+  "driving_side": "right",
+  "all_way_stop": {
+    "first_arrival": false,
+    "unknown_order": "tie",
+    "tie_rules": ["yield_right", "oncoming_left_yields"]
+  },
+  "uncontrolled_rules": ["yield_right", "oncoming_left_yields"],
+  "t_junction": "ending_road_yields",
+  "notes": [
+    "Section 8(1): at a junction without priority signs the vehicle from the right has priority (rechts vor links).",
+    "Section 9(3): a vehicle that turns across the oncoming lane lets oncoming vehicles pass.",
+    "A stop or give-way sign gives priority to the cross road: that is the two-way stop rule in the engine."
+  ]
+}
